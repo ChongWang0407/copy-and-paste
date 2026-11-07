@@ -1,0 +1,41 @@
+name: Publish prepared v1.0.0 release
+
+on:
+  push:
+    branches:
+      - release/v1.0.0
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-v1.0.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify prepared installer
+        run: |
+          echo '85562348d64b5c0e0715d48dd9242f2d73e2a458a763b89003f97ef19fa8ba2f  release/Copy-and-Paste_1.0.0_aarch64.dmg' | sha256sum --check
+      - name: Upload installer to existing draft
+        run: gh release upload v1.0.0 'release/Copy-and-Paste_1.0.0_aarch64.dmg'
+      - name: Publish v1.0.0
+        run: |
+          gh api --method PATCH "repos/$GH_REPO/releases/437763168" \
+            -f tag_name=v1.0.0 \
+            -f target_commitish=b2da5ec3cd1465a8bd3a5b698905d25a946a3f6b \
+            -f name='Copy & Paste v1.0.0' \
+            -f body="$(cat release/RELEASE_NOTES.md)" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=true \
+            --jq '{id, tag_name, draft, html_url, assets: [.assets[] | {name,size,digest}]}'
