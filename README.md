@@ -10,9 +10,8 @@
 
 前往本仓库的 [Releases 页面](https://github.com/ChongWang0407/copy-and-paste/releases)，下载 `Copy-and-Paste_1.0.dmg`；打开 DMG，将 `Copy & Paste.app` 拖入“应用程序”文件夹，再从“应用程序”启动。
 
-当前版本尚未经过 Apple 公证（详见 [Apple 官方说明](https://support.apple.com/zh-cn/102445)），若 macOS 阻止打开，请先关闭弹窗，再按下图操作允许 App 运行。
-
-![下载后四步开始使用：下载、关闭拦截提示、在隐私与安全性中允许打开、再次确认](docs/images/00-install-guide.png)
+当前版本尚未经过 Apple 公证（详见 [Apple 官方说明](https://support.apple.com/zh-cn/102445)），若 macOS 阻止打开，请先点击“完成”以关闭弹窗，再按下图操作允许 App 运行。
+![下载后五步打开：拖入应用程序、点击完成、在设置中找到应用、再次确认打开、指纹或密码验证](docs/images/00-install-guide.png)
 
 ## 功能
 
