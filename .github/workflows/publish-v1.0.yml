@@ -1,0 +1,38 @@
+name: Publish verified Copy & Paste v1.0
+on:
+  push:
+    branches: [release/v1.0]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_SHA: eab5ead31e4468e5a2daac5b2eb99caf119f6c5f
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify and update existing release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum --check SHA256SUMS.txt
+          current_tag=$(gh api "repos/$GH_REPO/releases/437763168" --jq .tag_name)
+          gh release upload "$current_tag" Copy-and-Paste_1.0.dmg SHA256SUMS.txt --clobber
+          actual_digest=$(gh api "repos/$GH_REPO/releases/437763168/assets" --jq '.[] | select(.name == "Copy-and-Paste_1.0.dmg") | .digest')
+          test "$actual_digest" = 'sha256:3035cb081aebb10d3d3199a0db084d730d9ee3175118e0d170f6c249683e20b5'
+          if gh api "repos/$GH_REPO/git/ref/tags/v1.0" > tag.json 2>/dev/null; then
+            test "$(jq -r .object.sha tag.json)" = "$SOURCE_SHA"
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/v1.0 -f sha="$SOURCE_SHA"
+          fi
+          jq -n --arg body "$(cat RELEASE_NOTES.md)" --arg sha "$SOURCE_SHA" '{tag_name:"v1.0",target_commitish:$sha,name:"Copy & Paste v1.0",body:$body,draft:false,prerelease:false,make_latest:"true"}' > release.json
+          gh api --method PATCH "repos/$GH_REPO/releases/437763168" --input release.json
+          old_asset=$(gh api "repos/$GH_REPO/releases/437763168/assets" --jq '.[] | select(.name == "Copy-and-Paste_1.0.0_aarch64.dmg") | .id')
+          if test -n "$old_asset"; then
+            gh api --method DELETE "repos/$GH_REPO/releases/assets/$old_asset"
+          fi
