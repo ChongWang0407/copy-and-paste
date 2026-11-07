@@ -1,28 +1,18 @@
 # Copy & Paste
 
-**复制随手，粘贴到位。** 一款专为 macOS 打造、数据保存在本机的开源剪贴板工具。
+一款专为 macOS 打造的轻量化开源剪贴板工具
 
-默认按 `⇧Z` 唤出窗口，查找复制过的文字、图片、文件等内容，点选即可粘贴到正在使用的应用。
+可设置开机静默启动，按自定义快捷键唤出窗口，查找复制过的文字、图片等内容，点选即可粘贴到正在使用的应用。
+
+![Copy & Paste — 专为 macOS 打造的剪贴板工具](docs/images/hero.png)
 
 ## 下载与首次打开
 
-前往本仓库的 [Releases 页面](../../releases)，在对应版本的 **Assets** 中下载 `Copy-and-Paste_1.0.0_aarch64.dmg`。打开 DMG，将 `Copy & Paste.app` 拖入“应用程序”文件夹，再从“应用程序”启动。Release 中自动生成的 **Source code** 压缩包是源码，不能直接作为安装包使用。
+前往本仓库的 [Releases 页面](https://github.com/ChongWang0407/copy-and-paste/releases)，下载 `Copy-and-Paste_1.0.dmg`；打开 DMG，将 `Copy & Paste.app` 拖入“应用程序”文件夹，再从“应用程序”启动。
 
-![Copy & Paste 安装与首次打开指南：下载、关闭首次拦截提示、在隐私与安全性中点仍要打开、再次确认](docs/images/00-install-guide.png)
+当前版本尚未经过 Apple 公证（详见 [Apple 官方说明](https://support.apple.com/zh-cn/102445)），若 macOS 阻止打开，请先关闭弹窗，再按下图操作允许 App 运行。
 
-当前安装包面向 **Apple 芯片 Mac**，采用 ad hoc 签名，尚未经过 Apple 公证。如果 macOS 阻止打开，请先关闭首次拦截弹窗，再到“系统设置 → 隐私与安全性 → 安全性”中找到这次被拦截的 App，点击“仍要打开”；系统再次弹窗时再点击“打开”。“仍要打开”只会在尝试启动该 App 后出现。详见 [Apple 官方说明](https://support.apple.com/zh-cn/102445)。
-
-## 界面演示
-
-以下图片使用应用界面与宣传片界面的源码、示例数据重新绘制，用于展示功能与视觉风格，并非应用的实际截图。
-
-![三种复制提示：玻璃胶囊、黑色胶囊、黑色刘海](docs/images/01-capsule.jpg)
-
-![搜索剪贴板文字以及图片中识别出的文字](docs/images/02-search.jpg)
-
-![勾选、排序并批量粘贴多条记录](docs/images/03-batch.jpg)
-
-![识别图片文字并粘贴到其他应用](docs/images/04-ocr.jpg)
+![下载后四步开始使用：下载、关闭拦截提示、在隐私与安全性中允许打开、再次确认](docs/images/00-install-guide.png)
 
 ## 功能
 
@@ -46,9 +36,7 @@
 
 ## 数据与隐私
 
-剪贴板记录默认保存在 `~/Library/Application Support/com.wangchong.copypaste/`。应用没有账号、云同步或使用情况统计。文字识别和翻译在本机完成；复制网页富文本时，应用可能下载其中的网络图片以保留内容。系统翻译语言包由 macOS 下载和管理。
-
-可以在设置中关闭持久化存储，使记录仅保留在当前会话中。
+剪贴板记录默认保存在 `~/Library/Application Support/com.copypaste/`。应用没有账号、云同步或使用情况统计。文字识别和翻译在本机完成；复制网页富文本时，应用可能下载其中的网络图片以保留内容。系统翻译语言包由 macOS 下载和管理。可以在设置中关闭持久化存储，使记录仅保留在当前会话中。
 
 ## 从源码构建
 
@@ -67,4 +55,6 @@ npm run tauri:build   # 生成 .app 与 .dmg
 
 ## 开源许可与致谢
 
-本项目基于 [TieZ](https://github.com/jimuzhe/tiez-clipboard) 修改，沿用 [GPL-3.0](LICENSE)。本项目重写了 macOS 界面，并移除了云同步、AI 等功能。液态玻璃窗口与 OCR 的实现参考了 [Maccy](https://github.com/p0deje/Maccy)（MIT）。
+本项目基于 [TieZ](https://github.com/jimuzhe/tiez-clipboard) 修改，沿用 [GPL-3.0](https://github.com/ChongWang0407/copy-and-paste/blob/main/LICENSE)，液态玻璃窗口与 OCR 的实现参考了 [Maccy](https://github.com/p0deje/Maccy)（MIT）。
+
+项目在 TieZ 基础上重写了原生 Liquid Glass 界面，移除了云同步、AI 等功能，增加了批量粘贴、复制弹窗、离线翻译与 OCR 等实用功能。

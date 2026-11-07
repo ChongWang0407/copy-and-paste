@@ -54,7 +54,18 @@ fn main() -> AppResult<()> {
             });
         }))
         .setup(|app| {
-            setup::init(app)?;
+            if let Err(error) = setup::init(app) {
+                use tauri::Manager;
+                use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                for window in app.webview_windows().values() {
+                    let _ = window.hide();
+                }
+                app.dialog()
+                    .message(format!("无法启动 Copy & Paste。\n\n{error}"))
+                    .title("Copy & Paste 启动失败")
+                    .kind(MessageDialogKind::Error)
+                    .show(|_| std::process::exit(1));
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

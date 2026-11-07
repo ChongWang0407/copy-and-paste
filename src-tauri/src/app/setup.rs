@@ -101,6 +101,13 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     // 2b. Local-at-rest encryption (AES-GCM + OS key store)
     crate::infrastructure::encryption::init(&app_dir);
 
+    if portable_data_dir().is_none() {
+        let legacy = legacy_app_data_dir(app.path())?;
+        let destination = default_app_data_dir(app.path())?;
+        crate::app::data_directory::finish(&legacy, &destination, &app_dir)
+            .map_err(std::io::Error::other)?;
+    }
+
     // 3. Database Initialization
     let db_path = app_dir.join("clipboard.db");
     let db_path_str = db_path.to_string_lossy();
@@ -153,6 +160,17 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 pub(crate) fn default_app_data_dir<R: tauri::Runtime>(
     paths: &tauri::path::PathResolver<R>,
 ) -> tauri::Result<std::path::PathBuf> {
+    let legacy = legacy_app_data_dir(paths)?;
+    Ok(crate::app::data_directory::default_directory(
+        &legacy,
+        cfg!(all(target_os = "macos", debug_assertions))
+            || legacy.file_name().is_some_and(|name| name.to_string_lossy().ends_with(".dev")),
+    ))
+}
+
+fn legacy_app_data_dir<R: tauri::Runtime>(
+    paths: &tauri::path::PathResolver<R>,
+) -> tauri::Result<std::path::PathBuf> {
     let dir = paths.app_data_dir()?;
     // `npm run tauri:dev` already uses the .dev identifier; only a
     // debug build run with the release config still needs the suffix.
@@ -165,7 +183,15 @@ pub(crate) fn default_app_data_dir<R: tauri::Runtime>(
 }
 
 fn resolve_data_dir(app: &App) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    if let Some(portable_data) = portable_data_dir() {
+        return Ok(portable_data);
+    }
     let default_app_dir = default_app_data_dir(app.path())?;
+    let legacy = legacy_app_data_dir(app.path())?;
+    crate::app::data_directory::prepare(&legacy, &default_app_dir)
+        .map_err(std::io::Error::other)?;
+    crate::app::data_directory::migrate_redirect(&legacy, &default_app_dir)
+        .map_err(std::io::Error::other)?;
 
     // Cleanup temp files
     std::thread::spawn(|| {
@@ -186,31 +212,8 @@ fn resolve_data_dir(app: &App) -> Result<std::path::PathBuf, Box<dyn std::error:
         }
     });
 
-    let redirect_file = default_app_dir.join("datapath.txt");
-    let mut app_dir = if redirect_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(&redirect_file) {
-            let custom_path = content.trim();
-            if custom_path.is_empty() {
-                default_app_dir.clone()
-            } else {
-                let custom_path_obj = std::path::Path::new(custom_path);
-                let is_app_bundle = custom_path.to_ascii_lowercase().ends_with(".app");
-                if custom_path_obj.exists() && custom_path_obj.is_dir() && !is_app_bundle {
-                    std::path::PathBuf::from(custom_path)
-                } else {
-                    default_app_dir.clone()
-                }
-            }
-        } else {
-            default_app_dir.clone()
-        }
-    } else {
-        default_app_dir.clone()
-    };
-
-    if let Some(portable_data) = portable_data_dir() {
-        app_dir = portable_data;
-    }
+    let app_dir = crate::app::data_directory::redirected_directory(&default_app_dir)
+        .map_err(std::io::Error::other)?;
 
     std::fs::create_dir_all(&app_dir)?;
     Ok(app_dir)
