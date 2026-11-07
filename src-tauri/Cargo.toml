@@ -1,0 +1,87 @@
+[package]
+name = "copy-paste"
+version = "1.0.0"
+description = "Copy & Paste - a liquid glass clipboard manager for macOS"
+authors = ["wangchong"]
+edition = "2021"
+default-run = "copy-paste"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+portable = []
+devtools = ["tauri/devtools"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.11", features = ["macos-private-api", "tray-icon", "image-png", "protocol-asset"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+base64 = "0.22"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
+tokio = { version = "1", features = ["time"] }
+tauri-plugin-dialog = "2.7"
+tauri-plugin-global-shortcut = "2.3.1"
+window-vibrancy = "0.8"
+
+regex = "1.12.2"
+tauri-plugin-single-instance = "2"
+uuid = { version = "1.19.0", features = ["v4"] }
+urlencoding = "2.1.3"
+tauri-plugin-fs = "2.4.5"
+sha2 = "0.10"
+ring = "0.17"
+# Web images inside copied rich text.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "blocking", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+htmd = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6.3"
+objc2-foundation = { version = "0.3.2", features = ["block2", "NSData", "NSDictionary", "NSError", "NSNotification", "NSObject", "NSOperation", "NSString", "NSArray", "NSURL", "NSGeometry"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSBitmapImageRep", "NSImage", "NSImageRep", "NSWorkspace", "NSPasteboard", "NSPasteboardItem", "NSRunningApplication", "NSWindow", "NSPanel", "NSApplication", "NSSound", "NSEvent", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSView", "NSResponder", "NSGraphicsContext", "NSScreen", "NSSharingService"] }
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }
+security-framework = "2"
+# 复制提示弹窗: the pill's shape is a Core Animation mask (smooth, off the main thread).
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CALayer", "CATransaction", "CAMediaTimingFunction", "CAMediaTiming"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColor"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-vision = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "VNObservation", "VNTypes", "VNDefines"] }
+
+# ============ Release 体积优化 ============
+[profile.release]
+# 启用 LTO (Link Time Optimization) - 可减少约 10-20% 体积
+lto = true
+# 使用单个 codegen unit，更好的优化但编译更慢
+codegen-units = 1
+# 优化级别：s = 优化大小，z = 更激进的大小优化
+opt-level = "z"
+# 移除符号表和调试信息
+strip = true
+# 启用 panic = abort 减少 unwinding 代码
+panic = "abort"
+
+# 图片编解码和缩略图用 opt-level 3：z 会关掉循环向量化，实测（macOS arm64，4K 截图）
+# 缩略图缩放 87ms → 5ms，PNG 编码 138ms → 63ms；压缩后体积只多约 100 KB，仍比 s 小。
+[profile.release.package.image]
+opt-level = 3
+[profile.release.package.png]
+opt-level = 3
+[profile.release.package.fdeflate]
+opt-level = 3
+[profile.release.package.miniz_oxide]
+opt-level = 3
+[profile.release.package.crc32fast]
+opt-level = 3
+[profile.release.package.simd-adler32]
+opt-level = 3
+[profile.release.package.adler2]
+opt-level = 3

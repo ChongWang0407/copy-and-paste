@@ -1,0 +1,5 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Copy & Paste Dev",
+  "identifier": "com.wangchong.copypaste.dev"
+}
