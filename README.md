@@ -6,7 +6,7 @@
 
 ## 下载与首次打开
 
-前往本仓库的 [Releases 页面](../../releases)，在对应版本的 **Assets** 中下载 `Copy & Paste_…_aarch64.dmg`。打开 DMG，将 `Copy & Paste.app` 拖入“应用程序”文件夹，再从“应用程序”启动。Release 中自动生成的 **Source code** 压缩包是源码，不能直接作为安装包使用。
+前往本仓库的 [Releases 页面](../../releases)，在对应版本的 **Assets** 中下载 `Copy-and-Paste_1.0.0_aarch64.dmg`。打开 DMG，将 `Copy & Paste.app` 拖入“应用程序”文件夹，再从“应用程序”启动。Release 中自动生成的 **Source code** 压缩包是源码，不能直接作为安装包使用。
 
 ![Copy & Paste 安装与首次打开指南：下载、关闭首次拦截提示、在隐私与安全性中点仍要打开、再次确认](docs/images/00-install-guide.png)
 
