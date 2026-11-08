@@ -4,7 +4,7 @@
 
 可设置开机静默启动，按自定义快捷键唤出窗口，查找复制过的文字、图片等内容，点选即可粘贴到正在使用的应用。
 
-![Copy & Paste — 专为 macOS 打造的剪贴板工具](docs/images/hero.png)
+![Copy & Paste — 专为 macOS 打造的剪贴板工具](docs/images/copy-and-paste-github-poster.png)
 
 ## 下载与首次打开
 
