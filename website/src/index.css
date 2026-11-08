@@ -1,0 +1,788 @@
+:root {
+  /* 产品主色，取自 App 的 src/styles/glass.css */
+  --accent: #0a84ff;
+  --accent-strong: #0066e0;
+  --accent-light: #2f97ff;
+  --accent-rgb: 10, 132, 255;
+
+  --ink: #0d1b2e;
+  --muted: #5b6b80;
+  --bg: #eef3fb;
+
+  --nav-top: 14px;
+  --nav-h: 60px;
+  --content-w: 1120px;
+
+
+  --glass-bg: rgba(255, 255, 255, 0.55);
+  --glass-border: rgba(255, 255, 255, 0.75);
+  --glass-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95), inset 0 -1px 0 rgba(255, 255, 255, 0.35),
+    0 10px 34px rgba(24, 56, 120, 0.1), 0 1px 3px rgba(24, 56, 120, 0.08);
+
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+    sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+html.is-intro {
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: linear-gradient(180deg, #f4f7fc 0%, var(--bg) 40%, #e9f0fa 100%);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+img {
+  display: block;
+}
+
+/* ---------- 背景光斑 ---------- */
+
+.bg-orbs {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0;
+}
+
+.bg-orbs.is-on {
+  opacity: 1;
+}
+
+.orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(90px);
+  will-change: transform;
+}
+
+.orb-a {
+  width: 52vw;
+  height: 52vw;
+  top: -18vw;
+  left: -14vw;
+  background: #a9d1ff;
+  opacity: 0.6;
+  animation: drift-a 22s ease-in-out infinite alternate;
+}
+
+.orb-b {
+  width: 44vw;
+  height: 44vw;
+  top: 12vh;
+  right: -16vw;
+  background: #cfe0ff;
+  opacity: 0.75;
+  animation: drift-b 26s ease-in-out infinite alternate;
+}
+
+.orb-c {
+  width: 60vw;
+  height: 34vw;
+  bottom: -18vw;
+  left: 18vw;
+  background: #8fc2ff;
+  opacity: 0.35;
+  animation: drift-a 30s ease-in-out infinite alternate-reverse;
+}
+
+@keyframes drift-a {
+  to {
+    transform: translate3d(8vw, 6vh, 0) scale(1.08);
+  }
+}
+
+@keyframes drift-b {
+  to {
+    transform: translate3d(-6vw, 10vh, 0) scale(0.92);
+  }
+}
+
+/* ---------- 开场 ---------- */
+
+.intro-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  cursor: pointer;
+}
+
+/* ---------- 液态玻璃标题栏 ---------- */
+
+.nav {
+  position: fixed;
+  top: var(--nav-top);
+  left: 0;
+  right: 0;
+  z-index: 100;
+  width: min(var(--content-w), calc(100% - 32px));
+  height: var(--nav-h);
+  margin: 0 auto;
+  padding: 0 10px 0 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.nav-pill {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  -webkit-backdrop-filter: blur(22px) saturate(180%);
+  backdrop-filter: blur(22px) saturate(180%);
+  transition: background 0.35s ease, box-shadow 0.35s ease;
+}
+
+/* 玻璃边缘的折射高光 */
+.nav-pill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(100deg, rgba(255, 255, 255, 0.6) 0%, transparent 22%, transparent 78%, rgba(255, 255, 255, 0.45) 100%);
+  pointer-events: none;
+}
+
+.nav.is-scrolled .nav-pill {
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95), 0 14px 40px rgba(24, 56, 120, 0.14), 0 1px 3px rgba(24, 56, 120, 0.08);
+}
+
+.brand {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand-logo {
+  width: 34px;
+  height: 34px;
+  filter: drop-shadow(0 3px 8px rgba(10, 102, 224, 0.28));
+}
+
+.brand-name {
+  display: inline-flex;
+  overflow: hidden;
+  font-family: ui-rounded, 'SF Pro Rounded', 'Nunito', -apple-system, sans-serif;
+  font-size: 21px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.brand-char {
+  display: inline-block;
+}
+
+.nav-left,
+.nav-right {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.nav-right {
+  gap: 10px;
+}
+
+.nav-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: #34465e;
+  background: rgba(255, 255, 255, 0.55);
+  box-shadow: inset 0 1px 0 #fff, 0 0 0 1px rgba(13, 27, 46, 0.05);
+}
+
+.nav-tag i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.18);
+}
+
+@media (max-width: 860px) {
+  .nav-tag {
+    display: none;
+  }
+}
+
+/* 品牌蓝渐变字：每个字铺同一条渐变并按位置平移，拼成连续渐变（见 gradientText.js） */
+.grad-char {
+  background-image: linear-gradient(135deg, #0a84ff 0%, #0057c8 55%, #3a3fd9 100%);
+  background-size: var(--gw) 100%;
+  background-position: var(--gx) 0;
+  background-repeat: no-repeat;
+  /* 笔画（y 的尾巴、e 的右缘、字距收紧后的末字）会伸出字框，背景只铺在框内就会被截掉；
+     加内边距扩大背景区域，负外边距抵消，排版不变 */
+  padding: 0.12em 0.14em;
+  margin: -0.12em -0.14em;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+/* ---------- 首屏：标题 + 宣传语 + 按钮 + 视频框正好一屏 ---------- */
+
+/* --video-max：视频框最大宽度。平时和内容区同宽，播放时由 Hero 的动画放开，让视频框继续长大 */
+.first-screen {
+  --video-max: var(--content-w);
+  height: 100svh;
+  min-height: 600px;
+  display: flex;
+  flex-direction: column;
+}
+
+.hero-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: calc(var(--nav-top) + var(--nav-h) + clamp(20px, 3.6vh, 44px)) 20px 0;
+}
+
+/* 宣传语：上行粗大（Copy、Paste 蓝色艺术字，其余黑色），下行细小 */
+.slogan-main {
+  line-height: 0;
+}
+
+.slogan-en {
+  margin: 0;
+  font-family: ui-rounded, 'SF Pro Rounded', 'Nunito', -apple-system, sans-serif;
+  font-size: clamp(1.6rem, 3.2vw, 2.7rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  color: #0b0d12;
+}
+
+.slogan-sub {
+  margin: clamp(4px, 1vh, 10px) 0 0;
+  font-size: clamp(0.95rem, 1.4vw, 1.2rem);
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+/* ---------- 彩虹按钮（Download / GitHub）：磁吸 + hover 阴影 + 彩虹边 ---------- */
+
+@property --rainbow-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+
+.magnetic {
+  display: inline-block;
+  padding: 10px;
+  margin: -10px;
+  border-radius: 999px;
+}
+
+.magnetic > div {
+  position: relative;
+  isolation: isolate;
+  border-radius: 999px;
+}
+
+/* 彩虹光晕（hover 时出现在按钮背后） */
+.magnetic > div::before {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  z-index: -1;
+  border-radius: inherit;
+  background: conic-gradient(from var(--rainbow-angle), #0a84ff, #5ac8fa, #af52de, #ff6b9a, #ffb340, #ffd84a, #34c759, #0a84ff);
+  filter: blur(16px);
+  opacity: 0;
+  transform: scale(0.9);
+  transition: opacity 0.4s ease, transform 0.4s ease;
+  animation: rainbow-spin 4s linear infinite;
+}
+
+.magnetic.is-active > div::before {
+  opacity: 0.7;
+  transform: scale(1);
+}
+
+.btn-rainbow {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 54px;
+  padding: 0 28px 0 24px;
+  border-radius: 999px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: #fff;
+  background: linear-gradient(180deg, #25282f 0%, #08090c 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 1px 2px rgba(0, 0, 0, 0.25), 0 4px 12px -4px rgba(10, 16, 30, 0.3);
+  transition: box-shadow 0.35s ease, transform 0.15s ease;
+}
+
+.btn-rainbow:active {
+  transform: scale(0.98);
+}
+
+/* 彩虹细边 */
+.btn-rainbow::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  padding: 1.5px;
+  border-radius: inherit;
+  background: conic-gradient(from var(--rainbow-angle), #0a84ff, #5ac8fa, #af52de, #ff6b9a, #ffb340, #ffd84a, #34c759, #0a84ff);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  opacity: 0;
+  transition: opacity 0.35s ease;
+  animation: rainbow-spin 4s linear infinite;
+  pointer-events: none;
+}
+
+.btn-nav {
+  height: 40px;
+  gap: 8px;
+  padding: 0 16px 0 14px;
+  font-size: 14px;
+}
+
+.btn-nav__arrow {
+  opacity: 0.6;
+  transition: transform 0.3s ease, opacity 0.3s ease;
+}
+
+.magnetic.is-active .btn-nav__arrow {
+  opacity: 1;
+  transform: translate(1px, -1px);
+}
+
+.magnetic.is-active .btn-rainbow {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.2), 0 22px 44px -14px rgba(8, 20, 60, 0.6), 0 8px 18px -8px rgba(8, 20, 60, 0.4);
+}
+
+.magnetic.is-active .btn-rainbow::after {
+  opacity: 1;
+}
+
+@keyframes rainbow-spin {
+  to {
+    --rainbow-angle: 360deg;
+  }
+}
+
+/* ---------- 视频框 ---------- */
+
+.showcase {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  margin-top: clamp(28px, 5vh, 56px);
+  padding: 0 16px clamp(14px, 2.4vh, 24px);
+  container-type: size;
+}
+
+.horizon {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 58%;
+  height: 2px;
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.9) 18%, #fff 50%, rgba(255, 255, 255, 0.9) 82%, transparent 100%);
+  box-shadow: 0 0 36px 14px rgba(130, 195, 255, 0.55), 0 0 90px 30px rgba(255, 255, 255, 0.6);
+  pointer-events: none;
+}
+
+.video-frame {
+  /* --frame-pad：白色玻璃边框的厚度（内边距 8px + 边框 1px）。
+     --chrome：边框显示程度，1 = 完整白框，0 = 无边框只留圆角视频。播放时由 Hero 的动画在两者之间渐变 */
+  --frame-pad: 9px;
+  --chrome: 1;
+  position: relative;
+  padding: calc(var(--frame-pad) * var(--chrome));
+  border-radius: 30px;
+  scroll-margin-top: calc(var(--nav-top) + var(--nav-h) + 16px);
+}
+
+/* 白色玻璃边框单独放一层，方便整体淡入淡出 */
+.video-frame::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: rgba(255, 255, 255, 0.5);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow), 0 40px 80px -30px rgba(10, 60, 150, 0.35);
+  -webkit-backdrop-filter: blur(20px) saturate(170%);
+  backdrop-filter: blur(20px) saturate(170%);
+  opacity: var(--chrome);
+  pointer-events: none;
+}
+
+/* 入场动画期间先关掉毛玻璃：带 backdrop-filter 的元素每移动一帧都要重新模糊背后的画面，会掉帧 */
+.video-frame.is-entering::before {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.video-inner {
+  position: relative;
+  /* 在剩余空间里按 16:9 撑到最大，减去两侧白框厚度（无边框播放时为 0） */
+  --frame-edge: calc(var(--frame-pad) * var(--chrome) * 2);
+  width: min(100cqw - var(--frame-edge), (100cqh - var(--frame-edge)) * 16 / 9, var(--video-max));
+  aspect-ratio: 16 / 9;
+  --inner-r: 22px;
+  border-radius: var(--inner-r);
+  overflow: hidden;
+  /* 视频是独立的合成层，浏览器有时只按 overflow + 圆角裁不住它，底部会露出黑色直角；
+     再加一层 clip-path 圆角裁剪兜底 */
+  clip-path: inset(0 round var(--inner-r));
+  isolation: isolate;
+  background: #061a3d;
+}
+
+.video-inner video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+  background: #000;
+}
+
+.video-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(90% 80% at 30% 15%, #6cc4ff 0%, transparent 55%),
+    radial-gradient(80% 90% at 85% 100%, #0039b8 0%, transparent 60%), linear-gradient(150deg, #2ea3ff 0%, #0a84ff 45%, #0057d9 100%);
+}
+
+.video-placeholder__glow {
+  position: absolute;
+  width: 42%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.4), transparent 65%);
+  filter: blur(20px);
+}
+
+.video-placeholder__logo {
+  position: relative;
+  width: 17%;
+  margin-bottom: 6%;
+  filter: drop-shadow(0 24px 40px rgba(0, 30, 100, 0.45));
+  animation: float 6s ease-in-out infinite;
+}
+
+@keyframes float {
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+.video-cover {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0 0 6%;
+  border: 0;
+  background: linear-gradient(180deg, transparent 55%, rgba(0, 20, 60, 0.28));
+  cursor: pointer;
+  font: inherit;
+  color: #fff;
+}
+
+/* 播放按钮和文字组成一颗深色玻璃胶囊（呼应参考图 1 的 Watch a product demo） */
+.video-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 22px 7px 7px;
+  border-radius: 999px;
+  background: rgba(12, 16, 26, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 14px 34px -10px rgba(0, 0, 0, 0.5);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  backdrop-filter: blur(16px) saturate(160%);
+  transition: transform 0.35s ease, box-shadow 0.35s ease;
+}
+
+.video-cover:hover .video-pill {
+  transform: translateY(-2px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 22px 44px -12px rgba(0, 0, 0, 0.6);
+}
+
+.video-play {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  color: var(--accent);
+  background: #fff;
+  transition: transform 0.3s ease;
+}
+
+.video-play svg {
+  width: 20px;
+  height: 20px;
+  margin-left: 2px;
+}
+
+.video-cover:hover .video-play {
+  transform: scale(1.08);
+}
+
+.video-caption {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  line-height: 1.35;
+}
+
+.video-caption strong {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.video-caption small {
+  font-size: 12px;
+  opacity: 0.68;
+}
+
+/* ---------- 功能亮点 ---------- */
+
+.features {
+  max-width: var(--content-w);
+  margin: 0 auto;
+  padding: clamp(40px, 6vh, 64px) 16px 40px;
+}
+
+/* 视频和卡片之间的分隔线 */
+.features-rule {
+  height: 1px;
+  margin: 0 0 clamp(36px, 5vh, 52px);
+  border: 0;
+  background: linear-gradient(90deg, transparent, rgba(13, 27, 46, 0.14) 15%, rgba(13, 27, 46, 0.14) 85%, transparent);
+}
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+}
+
+.feature-card {
+  padding: 26px 26px 28px;
+  border-radius: 24px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  -webkit-backdrop-filter: blur(18px) saturate(170%);
+  backdrop-filter: blur(18px) saturate(170%);
+  transition: transform 0.35s ease, box-shadow 0.35s ease;
+}
+
+.feature-card:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--glass-shadow), 0 24px 50px -24px rgba(10, 80, 200, 0.35);
+}
+
+.feature-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 13px;
+  color: #fff;
+  background: linear-gradient(160deg, #3aa8ff, var(--accent) 50%, var(--accent-strong));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 6px 14px -4px rgba(var(--accent-rgb), 0.55);
+}
+
+.feature-card h3 {
+  margin: 18px 0 2px;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.feature-en {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.feature-body {
+  margin: 10px 0 0;
+  font-size: 14.5px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+
+/* ---------- 页脚 ---------- */
+
+.footer {
+  max-width: var(--content-w);
+  margin: 72px auto 0;
+  padding: 26px 16px 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-top: 1px solid rgba(13, 27, 46, 0.08);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.footer-by {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.footer-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+/* ---------- 响应式 ---------- */
+
+@media (max-width: 900px) {
+  .feature-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 600px) {
+  :root {
+    --nav-h: 54px;
+  }
+
+  .first-screen {
+    height: auto;
+    min-height: 0;
+  }
+
+  .showcase {
+    flex: none;
+    container-type: normal;
+  }
+
+  .video-inner {
+    width: calc(100vw - 32px - var(--frame-edge));
+  }
+
+  .nav {
+    padding: 0 8px 0 12px;
+  }
+
+  .brand-logo {
+    width: 30px;
+    height: 30px;
+  }
+
+  .brand-name {
+    font-size: 16px;
+  }
+
+  .feature-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .footer {
+    flex-direction: column;
+    text-align: center;
+  }
+
+  .video-frame {
+    --frame-pad: 6px;
+    border-radius: 20px;
+  }
+
+  .video-inner {
+    --inner-r: 16px;
+  }
+
+  .video-caption small {
+    display: none;
+  }
+
+  .video-play {
+    width: 36px;
+    height: 36px;
+  }
+
+  .video-pill {
+    padding-right: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .orb,
+  .video-placeholder__logo,
+  .magnetic > div::before,
+  .btn-rainbow::after {
+    animation: none;
+  }
+}
