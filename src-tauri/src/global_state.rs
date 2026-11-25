@@ -96,4 +96,3 @@ pub static LAST_SHOW_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
 pub static NAVIGATION_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static NAVIGATION_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
-pub static IS_MAIN_WINDOW_FOCUSED: AtomicBool = AtomicBool::new(false);

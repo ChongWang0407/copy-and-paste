@@ -1,4 +1,4 @@
-import { CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu } from "@tauri-apps/api/menu";
+import { Menu, type MenuOptions } from "@tauri-apps/api/menu";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
 import { acquireBlurGuard, releaseBlurGuard } from "./focus";
 
@@ -26,19 +26,20 @@ let queue: Promise<void> = Promise.resolve();
 
 type Choose = (action: () => void) => () => void;
 
-type BuiltItem = MenuItem | CheckMenuItem | PredefinedMenuItem | Submenu;
+type ItemOptions = NonNullable<MenuOptions["items"]>[number];
 
-const buildItem = async (item: NativeMenuItem, choose: Choose): Promise<BuiltItem> => {
-  if (item.separator) return PredefinedMenuItem.new({ item: "Separator" });
+// Inline items belong to the root menu and have no separate resource handles.
+const itemOptions = (item: NativeMenuItem, choose: Choose): ItemOptions => {
+  if (item.separator) return { item: "Separator" };
+  const text = item.text ?? "";
   if (item.children) {
-    const items = await Promise.all(item.children.map((child) => buildItem(child, choose)));
-    return Submenu.new({ text: item.text ?? "", items });
+    return { text, items: item.children.map((child) => itemOptions(child, choose)) };
   }
   const action = item.action ? choose(item.action) : undefined;
   if (item.checked !== undefined) {
-    return CheckMenuItem.new({ text: item.text ?? "", checked: item.checked, action });
+    return { text, checked: item.checked, action };
   }
-  return MenuItem.new({ text: item.text ?? "", action });
+  return { text, action };
 };
 
 /**
@@ -63,8 +64,7 @@ const present = async (items: NativeMenuItem[], at?: { x: number; y: number }) =
   try {
     await previousMenu?.close().catch(() => {});
     previousMenu = null;
-    const built = await Promise.all(items.map((item) => buildItem(item, choose)));
-    const menu = await Menu.new({ items: built });
+    const menu = await Menu.new({ items: items.map((item) => itemOptions(item, choose)) });
     previousMenu = menu;
     await menu.popup(at ? new LogicalPosition(at.x, at.y) : undefined);
   } catch (error) {

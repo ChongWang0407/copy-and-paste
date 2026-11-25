@@ -273,7 +273,7 @@ const AppSelector = ({
                             onMouseDown={(event) => event.preventDefault()}
                             onClick={() => handleSelect(app)}
                         >
-                            {app.label}
+                            <span className="app-selector-option-label">{app.label}</span>
                         </button>
                     );
                 })}
@@ -293,6 +293,7 @@ const AppSelector = ({
                 <input
                     ref={inputRef}
                     autoFocus
+                    data-autofocus
                     value={query}
                     role="combobox"
                     aria-autocomplete="list"

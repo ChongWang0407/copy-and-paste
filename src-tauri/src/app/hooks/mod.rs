@@ -9,12 +9,16 @@ use crate::global_state::*;
 /// shortcuts step aside so pressing one reaches the recorder.
 #[tauri::command]
 pub fn set_recording_mode(app_handle: AppHandle, enabled: bool) -> Result<(), String> {
-    IS_RECORDING.store(enabled, Ordering::SeqCst);
-    CLIPBOARD_MONITOR_PAUSED.store(enabled, Ordering::Relaxed);
     if enabled {
-        let _ = app_handle.global_shortcut().unregister_all();
-        Ok(())
-    } else {
-        crate::app::commands::sync_registered_hotkeys(&app_handle).map_err(|e| e.to_string())
+        app_handle.global_shortcut().unregister_all().map_err(|error| error.to_string())?;
+        update_recording_flags(true);
+    } else if update_recording_flags(false) {
+        crate::app::commands::sync_registered_hotkeys(&app_handle).map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+pub(crate) fn update_recording_flags(enabled: bool) -> bool {
+    CLIPBOARD_MONITOR_PAUSED.store(enabled, Ordering::Relaxed);
+    IS_RECORDING.swap(enabled, Ordering::SeqCst)
 }

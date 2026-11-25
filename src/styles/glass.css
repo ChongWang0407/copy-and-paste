@@ -258,6 +258,26 @@ p {
   box-shadow: var(--glass-highlight), 0 0 0 0.5px rgba(var(--accent-rgb), 0.4);
 }
 
+.icon-button .pin-icon {
+  transition: transform 0.18s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.icon-button.is-pin-top {
+  color: #fff;
+  background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.92), rgba(var(--accent-strong-rgb), 0.92));
+  box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.5), 0 1px 3px rgba(var(--accent-strong-rgb), 0.28);
+}
+
+.icon-button.is-pin-top:hover {
+  background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.96), rgba(var(--accent-strong-rgb), 0.96));
+  filter: brightness(1.06);
+}
+
+.icon-button.is-pin-top .pin-icon {
+  fill: currentColor;
+  transform: rotate(-45deg);
+}
+
 /* Settings 返回: the arrow points up-left at rest and turns level on hover,
    over a solid theme-colour fill. */
 .back-button svg {
@@ -2013,18 +2033,37 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* App picker ------------------------------------------------------------- */
 
+.modal-overlay-app-selector {
+  background: rgba(0, 0, 0, 0.24);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+}
+
 .modal-panel-app-selector {
-  width: min(420px, 100%);
+  width: min(340px, 100%);
   max-height: calc(100vh - 32px);
   display: flex;
   flex-direction: column;
   gap: 10px;
+  background: rgba(250, 250, 252, 0.92);
+  -webkit-backdrop-filter: blur(28px) saturate(160%);
+  backdrop-filter: blur(28px) saturate(160%);
 }
 
 .modal-panel-header {
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
+}
+
+.modal-panel-app-selector .modal-button {
+  flex: none;
+  padding: 0 9px;
+  font-size: 12px;
+  white-space: nowrap;
+  transition: background 0.12s ease;
 }
 
 .modal-button {
@@ -2044,15 +2083,25 @@ input[type="range"]::-webkit-slider-thumb {
   background: var(--glass-fill-hover);
 }
 
+.modal-panel-app-selector .modal-button:active {
+  background: var(--glass-fill-active);
+}
+
 .modal-button.icon-only {
   width: 28px;
   padding: 0;
 }
 
 .modal-panel-actions {
+  flex: none;
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 6px;
+}
+
+.app-selector-reset {
+  margin-right: auto;
 }
 
 .selector-container {
@@ -2064,6 +2113,7 @@ input[type="range"]::-webkit-slider-thumb {
 .app-selector {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -2088,14 +2138,23 @@ input[type="range"]::-webkit-slider-thumb {
   padding: 0 9px 0 30px;
   border: 0;
   border-radius: var(--radius-small);
-  background: rgba(255, 255, 255, 0.4);
-  box-shadow: 0 0 0 0.5px var(--glass-line-strong);
+  font-size: 13px;
+  background: rgba(255, 255, 255, 0.65);
+  box-shadow: 0 0 0 0.5px var(--glass-line-strong), inset 0 1px 2px rgba(0, 0, 0, 0.04);
+  transition: box-shadow 0.14s ease, background 0.14s ease;
+}
+
+.app-selector-search input:focus,
+.app-selector-search input:focus-visible {
+  outline: none;
+  background: rgba(255, 255, 255, 0.88);
+  box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.7), 0 0 0 3px rgba(var(--accent-rgb), 0.16);
 }
 
 .app-selector-list {
   flex: 1 1 auto;
-  min-height: 160px;
-  max-height: 300px;
+  min-height: 120px;
+  max-height: min(300px, calc(100vh - 200px));
   overflow-y: auto;
 }
 
@@ -2108,12 +2167,22 @@ input[type="range"]::-webkit-slider-thumb {
 
 .app-selector-option {
   width: 100%;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 5px 6px;
   border-radius: var(--radius-small);
+  font-size: 13px;
   text-align: left;
+}
+
+.app-selector-option-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .app-selector-option:hover,

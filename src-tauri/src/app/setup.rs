@@ -6,6 +6,7 @@ use crate::app_state::{AppDataDir, EncryptionQueueState, PasteQueue, SessionHist
 use crate::database::{self, DbState};
 use crate::global_state::*;
 use crate::info;
+use crate::infrastructure::macos_api::window::{self as panel, WindowPinMode, PIN_MODE_KEY};
 use crate::infrastructure::repository::clipboard_repo::SqliteClipboardRepository;
 use crate::infrastructure::repository::settings_repo::{
     SettingsRepository, SqliteSettingsRepository,
@@ -64,13 +65,11 @@ fn register_macos_pinned_escape_monitor(app_handle: AppHandle) {
 
     const KEY_ESCAPE: u16 = 53;
     let handler = RcBlock::new(move |event: NonNull<NSEvent>| {
-        if !WINDOW_PINNED.load(Ordering::Relaxed)
-            || !crate::infrastructure::macos_api::window::is_clipboard_panel_visible()
-        {
-            return;
-        }
         let key = unsafe { event.as_ref().keyCode() };
-        if key == KEY_ESCAPE {
+        if key == KEY_ESCAPE
+            && panel::is_clipboard_panel_visible()
+            && panel::responds_to_global_escape(&app_handle)
+        {
             let _ = crate::app::window_manager::escape_window_cmd(app_handle.clone());
         }
     });
@@ -87,6 +86,8 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     register_macos_wake_hotkey_refresh(app_handle.clone());
     #[cfg(target_os = "macos")]
     register_macos_pinned_escape_monitor(app_handle.clone());
+    #[cfg(target_os = "macos")]
+    panel::start_window_tracking();
 
     // Initialize GLOBAL_APP_HANDLE
     let _ = GLOBAL_APP_HANDLE.set(app_handle.clone());
@@ -247,6 +248,7 @@ pub struct StartupSettings {
     pub main_hotkey: String,
     pub arrow_key_selection: bool,
     pub window_position_mode: String,
+    pub window_pin_mode: WindowPinMode,
     /// No window has been shown yet: a new user, or settings just restored.
     pub first_open: bool,
     pub glass_level: u64,
@@ -299,6 +301,7 @@ pub(crate) fn load_settings(repo: &impl SettingsRepository) -> StartupSettings {
             "follow_mouse",
         ))
         .to_string(),
+        window_pin_mode: WindowPinMode::from_setting(&get(PIN_MODE_KEY, "always_on_top")),
         glass_level: get("app.glass_level", "35")
             .parse::<u64>()
             .map(|v| v.min(100))
@@ -360,6 +363,7 @@ pub(crate) fn settings_state_from(s: &StartupSettings) -> SettingsState {
         arrow_key_selection: AtomicBool::new(s.arrow_key_selection),
         main_hotkey: std::sync::Mutex::new(s.main_hotkey.clone()),
         window_position_mode: std::sync::Mutex::new(s.window_position_mode.clone()),
+        window_pin_mode: std::sync::Mutex::new(s.window_pin_mode),
         glass_level: AtomicU64::new(s.glass_level),
         capsule_enabled: AtomicBool::new(s.capsule_enabled),
         capsule_style: std::sync::Mutex::new(s.capsule_style.clone()),
@@ -402,7 +406,6 @@ fn setup_main_window(app: &App, s: &StartupSettings) {
                 }));
             }
         }
-        let _ = window.set_always_on_top(effective_pinned);
         // Space flags before panel conversion.
         set_window_all_spaces(&window);
     }
@@ -489,8 +492,6 @@ fn login_item_switched_off() -> bool {
 
 
 fn start_services(app: &App, s: &StartupSettings, app_handle: AppHandle) {
-    #[cfg(target_os = "macos")]
-    crate::infrastructure::macos_api::window_tracker::start_window_tracking(app_handle.clone());
     crate::services::clipboard::start_clipboard_monitor(app_handle.clone());
 
     let db_state = app.state::<DbState>();
@@ -609,8 +610,8 @@ pub fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
         return;
     }
     match event {
-        tauri::WindowEvent::Focused(focused) => {
-            IS_MAIN_WINDOW_FOCUSED.store(*focused, Ordering::Relaxed);
+        tauri::WindowEvent::Focused(false) => {
+            panel::remember_frontmost_external_app();
         }
         tauri::WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();

@@ -1,7 +1,7 @@
 #[cfg(target_os = "macos")]
 use objc2::rc::autoreleasepool;
 #[cfg(target_os = "macos")]
-use objc2_app_kit::NSWorkspace;
+use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 #[cfg(target_os = "macos")]
 use objc2_foundation::NSString;
 use tauri::AppHandle;
@@ -15,28 +15,53 @@ pub struct ActiveAppInfo {
     pub process_path: Option<String>,
 }
 
-pub fn start_window_tracking(_app_handle: AppHandle) {
-    #[cfg(target_os = "macos")]
-    std::thread::spawn(move || {
-        use std::sync::atomic::Ordering;
-        let self_pid = std::process::id();
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            // Only track while this window is not focused, so the "previous"
-            // app is never overwritten with ourselves.
-            if !crate::global_state::IS_MAIN_WINDOW_FOCUSED.load(Ordering::Relaxed) {
-                let info = get_active_app_snapshot();
-                if info.pid != 0 {
-                    let name = info.app_name;
-                    let pid = info.pid;
-                    if pid != 0 && pid != self_pid {
-                        crate::global_state::LAST_ACTIVE_APP_PID.store(pid, Ordering::Relaxed);
-                        crate::global_state::set_last_active_app_name(name);
-                    }
-                }
-            }
+pub fn start_window_tracking() {
+    use block2::RcBlock;
+    use objc2_app_kit::{NSWorkspaceApplicationKey, NSWorkspaceDidActivateApplicationNotification};
+    use objc2_foundation::{NSNotification, NSOperationQueue};
+    use std::ptr::NonNull;
+
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    let handler = RcBlock::new(|notification: NonNull<NSNotification>| {
+        // The Dock may already have activated us by the time this arrives.
+        // The notification still identifies the external app that preceded us.
+        let notification = unsafe { notification.as_ref() };
+        if let Some(app) = notification.userInfo()
+            .and_then(|info| info.objectForKey(unsafe { NSWorkspaceApplicationKey }))
+            .and_then(|app| app.downcast::<NSRunningApplication>().ok())
+        {
+            remember_external_app(&app);
         }
     });
+    // The observer lives for the lifetime of the application.
+    unsafe {
+        let observer = center.addObserverForName_object_queue_usingBlock(
+            Some(NSWorkspaceDidActivateApplicationNotification),
+            None,
+            Some(&NSOperationQueue::mainQueue()),
+            &handler,
+        );
+        let _ = objc2::rc::Retained::into_raw(observer);
+    }
+    remember_frontmost_external_app();
+}
+
+pub fn remember_frontmost_external_app() {
+    autoreleasepool(|_| {
+        let Some(app) = NSWorkspace::sharedWorkspace().frontmostApplication() else {
+            return;
+        };
+        remember_external_app(&app);
+    });
+}
+
+fn remember_external_app(app: &NSRunningApplication) {
+    let pid = app.processIdentifier() as u32;
+    if pid != 0 && pid != std::process::id() {
+        let name = app.localizedName().map(|name| name.to_string()).unwrap_or_default();
+        crate::global_state::set_last_active_app_name(name);
+        crate::global_state::LAST_ACTIVE_APP_PID.store(pid, AtomicOrdering::Relaxed);
+    }
 }
 
 pub fn get_active_app_snapshot() -> ActiveAppInfo {
@@ -75,21 +100,92 @@ pub fn get_active_app_snapshot() -> ActiveAppInfo {
 
 }
 
-pub fn get_active_app_info() -> (String, String) {
-    let info = get_active_app_snapshot();
-    let pid = if info.pid == 0 {
-        String::new()
-    } else {
-        info.pid.to_string()
-    };
-    (info.app_name, pid)
+pub const PIN_MODE_KEY: &str = "app.window_pin_mode";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowPinMode {
+    #[default]
+    AlwaysOnTop,
+    Normal,
+}
+
+impl WindowPinMode {
+    pub fn from_setting(value: &str) -> Self {
+        if value == "normal" { Self::Normal } else { Self::AlwaysOnTop }
+    }
+
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::AlwaysOnTop => "always_on_top",
+            Self::Normal => "normal",
+        }
+    }
+}
+
+use tauri_nspanel::PanelLevel;
+
+fn panel_policy(pinned: bool, mode: WindowPinMode, lowered: bool) -> (i64, bool, bool) {
+    let floating = !lowered && !(pinned && mode == WindowPinMode::Normal);
+    let level = if floating { PanelLevel::Dock } else { PanelLevel::Normal };
+    (level.value(), floating, pinned && mode == WindowPinMode::AlwaysOnTop)
+}
+
+fn pin_mode(app: &AppHandle) -> WindowPinMode {
+    app.try_state::<crate::app_state::SettingsState>()
+        .map(|settings| *settings.window_pin_mode.lock().unwrap())
+        .unwrap_or_default()
+}
+
+pub fn responds_to_global_escape(app: &AppHandle) -> bool {
+    let (_, _, responds) = panel_policy(
+        crate::global_state::WINDOW_PINNED.load(AtomicOrdering::Relaxed),
+        pin_mode(app),
+        is_panel_lowered(),
+    );
+    responds
+}
+
+fn lowered_owners() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static OWNERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    &OWNERS
+}
+
+fn is_panel_lowered() -> bool {
+    !lowered_owners().lock().unwrap().is_empty()
+}
+
+// Called on the main thread, including by delayed show and fullscreen work.
+fn apply_panel_policy(app: &AppHandle) {
+    use tauri_nspanel::ManagerExt;
+    let pinned = crate::global_state::WINDOW_PINNED.load(AtomicOrdering::Relaxed);
+    let (level, floating, _) = panel_policy(pinned, pin_mode(app), is_panel_lowered());
+    if let Ok(panel) = app.get_webview_panel("main") {
+        if panel.is_floating_panel() != floating {
+            panel.set_floating_panel(floating);
+        }
+        if panel.as_panel().level() as i64 != level {
+            panel.set_level(level);
+        }
+        // Pinned palettes keep the paste target's keyboard focus on ordinary clicks.
+        if panel.becomes_key_only_if_needed() != pinned {
+            panel.set_becomes_key_only_if_needed(pinned);
+        }
+    } else if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_always_on_top(floating);
+    }
+}
+
+pub fn refresh_clipboard_panel_policy(app: &AppHandle) -> tauri::Result<()> {
+    let handle = app.clone();
+    app.run_on_main_thread(move || apply_panel_policy(&handle))
 }
 
 #[cfg(target_os = "macos")]
 tauri_nspanel::tauri_panel! {
     panel!(ClipboardPanel {
         config: {
-            is_floating_panel: true,
             can_become_key_window: true,
             can_become_main_window: false
         }
@@ -119,14 +215,12 @@ pub fn set_window_focusable(window: &tauri::WebviewWindow, focusable: bool) {
 /// See EcoPaste / tauri-nspanel fullscreen example.
 #[cfg(target_os = "macos")]
 pub fn setup_clipboard_panel(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use tauri_nspanel::{CollectionBehavior, PanelLevel, StyleMask, WebviewWindowExt};
+    use tauri_nspanel::{CollectionBehavior, StyleMask, WebviewWindowExt};
 
     let panel = window
         .to_panel::<ClipboardPanel>()
         .map_err(|e| format!("to_panel failed: {e:?}"))?;
 
-    // Dock level sits above normal fullscreen content without using screen-saver.
-    panel.set_level(PanelLevel::Dock.value());
     // Keep NonactivatingPanel for fullscreen overlay, but preserve Resizable —
     // StyleMask::empty().nonactivating_panel() alone wiped the resize bit and
     // made the undecorated window edges undraggable.
@@ -137,7 +231,7 @@ pub fn setup_clipboard_panel(window: &tauri::WebviewWindow) -> Result<(), String
     // a visible-but-not-key (or internally-visible-but-actually-hidden) state.
     panel.set_hides_on_deactivate(false);
     panel.set_works_when_modal(true);
-    panel.set_becomes_key_only_if_needed(false);
+    apply_panel_policy(window.app_handle());
     // Idle/hidden: move_to_active_space so the next show lands on the current Space
     // (including another app's fullscreen desktop).
     panel.set_collection_behavior(
@@ -157,6 +251,7 @@ pub fn setup_clipboard_panel(window: &tauri::WebviewWindow) -> Result<(), String
     let handler = ClipboardPanelEventHandler::new();
     let app_handle = window.app_handle().clone();
     handler.window_did_resign_key(move |_| {
+        remember_frontmost_external_app();
         if should_keep_clipboard_panel_visible() || !is_clipboard_panel_visible() {
             return;
         }
@@ -168,44 +263,14 @@ pub fn setup_clipboard_panel(window: &tauri::WebviewWindow) -> Result<(), String
         let handle = app_handle.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(16)).await;
-            if overlay_show_generation().load(AtomicOrdering::SeqCst) != generation
-                || overlay_presented_generation().load(AtomicOrdering::SeqCst) != generation
+            if !is_current_presentation(generation)
                 || !is_clipboard_panel_visible()
                 || should_keep_clipboard_panel_visible()
             {
                 return;
             }
 
-            let panel_handle = handle.clone();
-            let _ = handle.run_on_main_thread(move || {
-                if overlay_show_generation().load(AtomicOrdering::SeqCst) != generation
-                    || overlay_presented_generation().load(AtomicOrdering::SeqCst) != generation
-                    || !is_clipboard_panel_visible()
-                    || should_keep_clipboard_panel_visible()
-                {
-                    return;
-                }
-
-                use tauri_nspanel::ManagerExt;
-                let Ok(panel) = panel_handle.get_webview_panel("main") else {
-                    clipboard_panel_visible().store(false, AtomicOrdering::SeqCst);
-                    return;
-                };
-
-                if !panel.is_visible() {
-                    return;
-                }
-
-                if panel.as_panel().isKeyWindow() {
-                    return;
-                }
-
-                eprintln!("[macos-overlay] panel resigned key; hide gen={generation}");
-                let hide_handle = panel_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = crate::app::window_manager::hide_window_on_resign(hide_handle);
-                });
-            });
+            let _ = crate::app::window_manager::hide_window_on_resign(handle, generation);
         });
     });
     panel.set_event_handler(Some(handler.as_ref()));
@@ -255,21 +320,21 @@ fn overlay_presented_generation() -> &'static AtomicU64 {
 
 /// Show the non-activating panel and make it key without activating the app.
 #[cfg(target_os = "macos")]
-pub fn set_clipboard_panel_lowered(app: &AppHandle, lowered: bool) {
-    use tauri_nspanel::{ManagerExt, PanelLevel};
-
-    let handle = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Ok(panel) = handle.get_webview_panel("main") {
-            let level = if lowered { PanelLevel::Normal } else { PanelLevel::Dock };
-            panel.set_level(level.value());
+pub fn set_clipboard_panel_lowered(app: &AppHandle, owner: String, lowered: bool) -> tauri::Result<()> {
+    {
+        let mut owners = lowered_owners().lock().unwrap();
+        if lowered {
+            owners.insert(owner);
+        } else {
+            owners.remove(&owner);
         }
-    });
+    }
+    refresh_clipboard_panel_policy(app)
 }
 
 pub fn show_clipboard_panel(app: &AppHandle) -> bool {
     use std::sync::atomic::Ordering;
-    use tauri_nspanel::{CollectionBehavior, ManagerExt, PanelLevel};
+    use tauri_nspanel::{CollectionBehavior, ManagerExt};
 
     if app.get_webview_panel("main").is_err() {
         eprintln!("[macos-overlay] get_webview_panel(main) failed");
@@ -309,7 +374,7 @@ pub fn show_clipboard_panel(app: &AppHandle) -> bool {
                 if let Some(window) = app_for_panel.get_webview_window("main") {
                     crate::app::window_manager::apply_window_vibrancy(&app_for_panel, &window);
                 }
-                panel.set_level(PanelLevel::Dock.value());
+                apply_panel_policy(&app_for_panel);
                 // This is the hidden -> visible transition, so there is no live
                 // editor caret to preserve. Initializing the panel content view
                 // as first responder is required for first-mouse delivery after
@@ -406,23 +471,22 @@ pub fn make_clipboard_panel_key(app: &AppHandle) -> bool {
         .is_ok()
 }
 
-/// A pinned clipboard acts like a passive palette: ordinary item/button clicks
-/// must reach WebKit without taking key status from the paste target. Editable
-/// controls still explicitly call `make_clipboard_panel_key` through the focus
-/// coordinator when they need keyboard input.
-#[cfg(target_os = "macos")]
-pub fn set_clipboard_panel_pinned_interaction(app: &AppHandle, pinned: bool) -> bool {
+pub fn can_hide_clipboard_panel_on_resign(app: &AppHandle, generation: u64) -> bool {
     use tauri_nspanel::ManagerExt;
 
-    let handle = app.clone();
-    let app_for_panel = handle.clone();
-    handle
-        .run_on_main_thread(move || {
-            if let Ok(panel) = app_for_panel.get_webview_panel("main") {
-                panel.set_becomes_key_only_if_needed(pinned);
-            }
-        })
-        .is_ok()
+    if !is_current_presentation(generation)
+        || !is_clipboard_panel_visible()
+        || should_keep_clipboard_panel_visible()
+    {
+        return false;
+    }
+    app.get_webview_panel("main")
+        .is_ok_and(|panel| panel.is_visible() && !panel.as_panel().isKeyWindow())
+}
+
+fn is_current_presentation(generation: u64) -> bool {
+    overlay_show_generation().load(AtomicOrdering::SeqCst) == generation
+        && overlay_presented_generation().load(AtomicOrdering::SeqCst) == generation
 }
 
 #[cfg(target_os = "macos")]
@@ -552,7 +616,7 @@ pub fn present_overlay_above_fullscreen_async(window: &tauri::WebviewWindow) {
 /// (repeated show_and_make_key steals the first click / fights hide).
 #[cfg(target_os = "macos")]
 pub fn reinforce_overlay_above_fullscreen(window: &tauri::WebviewWindow) {
-    use tauri_nspanel::{CollectionBehavior, ManagerExt, PanelLevel};
+    use tauri_nspanel::{CollectionBehavior, ManagerExt};
 
     let gen = overlay_show_generation().load(AtomicOrdering::SeqCst);
     let app_for_retry = window.app_handle().clone();
@@ -568,7 +632,7 @@ pub fn reinforce_overlay_above_fullscreen(window: &tauri::WebviewWindow) {
                     return;
                 }
                 if let Ok(panel) = handle.get_webview_panel("main") {
-                    panel.set_level(PanelLevel::Dock.value());
+                    apply_panel_policy(&handle);
                     panel.set_collection_behavior(
                         CollectionBehavior::new()
                             .full_screen_auxiliary()
@@ -580,4 +644,28 @@ pub fn reinforce_overlay_above_fullscreen(window: &tauri::WebviewWindow) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{panel_policy, PanelLevel, WindowPinMode};
+
+    #[test]
+    fn panel_policy_covers_pinning_modes_and_temporary_lowering() {
+        use WindowPinMode::{AlwaysOnTop, Normal};
+        let dock = PanelLevel::Dock.value();
+        let normal = PanelLevel::Normal.value();
+        for (pinned, mode, lowered, expected) in [
+            (false, AlwaysOnTop, false, (dock, true, false)),
+            (false, AlwaysOnTop, true, (normal, false, false)),
+            (false, Normal, false, (dock, true, false)),
+            (false, Normal, true, (normal, false, false)),
+            (true, AlwaysOnTop, false, (dock, true, true)),
+            (true, AlwaysOnTop, true, (normal, false, true)),
+            (true, Normal, false, (normal, false, false)),
+            (true, Normal, true, (normal, false, false)),
+        ] {
+            assert_eq!(panel_policy(pinned, mode, lowered), expected);
+        }
+    }
 }

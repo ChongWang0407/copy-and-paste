@@ -2,6 +2,7 @@ use crate::app::commands::hotkey_cmd::sync_registered_hotkeys;
 use crate::app_state::{PasteQueue, SettingsState};
 use crate::database::DbState;
 use crate::error::{AppError, AppResult};
+use crate::infrastructure::macos_api::window::{self as panel, WindowPinMode, PIN_MODE_KEY};
 use crate::infrastructure::repository::settings_repo::SettingsRepository;
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Manager, State};
@@ -114,6 +115,7 @@ pub fn save_setting(
                 *guard = crate::app::window_manager::normalize_position_mode(&value).to_string();
             }
         }
+        PIN_MODE_KEY => return set_window_pin_mode(app_handle, WindowPinMode::from_setting(&value)),
         crate::app::capsule::ENABLED_KEY => {
             let enabled = value != "false";
             settings_state.capsule_enabled.store(enabled, Ordering::Relaxed);
@@ -164,28 +166,31 @@ pub fn set_window_pinned(app_handle: AppHandle, pinned: bool) {
     set_pinned_state(&app_handle, pinned);
 }
 
-/// Pinned = above every window, survives losing focus, and only Esc closes it.
+/// A pinned window stays open after focus moves to another app or after pasting.
 pub fn set_pinned_state(app_handle: &AppHandle, pinned: bool) {
     crate::WINDOW_PINNED.store(pinned, Ordering::Relaxed);
-    if let Some(window) = app_handle.get_webview_window("main") {
-        let _ = window.set_always_on_top(pinned);
-        #[cfg(target_os = "macos")]
-        {
-            // NSPanel focusability cannot be changed through Tauri after panel
-            // conversion. In pinned mode, let ordinary clicks pass through
-            // without making the clipboard key; editable controls opt in via
-            // the shared focus coordinator.
-            let _ = crate::infrastructure::macos_api::window::set_clipboard_panel_pinned_interaction(
-                app_handle,
-                pinned,
-            );
-        }
-    }
+    let _ = panel::refresh_clipboard_panel_policy(app_handle);
     if let Some(state) = app_handle.try_state::<DbState>() {
         let _ = state
             .settings_repo
             .set("app.window_pinned", &pinned.to_string());
     }
+}
+
+#[tauri::command]
+pub fn set_window_pin_mode(app_handle: AppHandle, mode: WindowPinMode) -> AppResult<()> {
+    let settings = app_handle.state::<SettingsState>();
+    {
+        let mut current = settings.window_pin_mode.lock().unwrap();
+        app_handle
+            .state::<DbState>()
+            .settings_repo
+            .set(PIN_MODE_KEY, mode.as_setting())
+            .map_err(AppError::from)?;
+        *current = mode;
+    }
+    panel::refresh_clipboard_panel_policy(&app_handle)
+        .map_err(|error| AppError::Internal(error.to_string()))
 }
 
 #[tauri::command]
@@ -301,6 +306,8 @@ pub fn reset_settings(
     // Running state follows the defaults now, not after the next start.
     let fresh = crate::app::setup::load_settings(&state.settings_repo);
     settings_state.take_values_from(crate::app::setup::settings_state_from(&fresh));
+    panel::refresh_clipboard_panel_policy(&app)
+        .map_err(|error| AppError::Internal(error.to_string()))?;
     *crate::global_state::HOTKEY_STRING.lock().unwrap() = fresh.main_hotkey.clone();
     // The window applies the rest when it reloads, but not these two.
     let _ = set_tray_visible(app.clone(), app.state(), !fresh.hide_tray_icon);

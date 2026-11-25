@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, ChevronRight } from "lucide-react";
@@ -144,29 +144,41 @@ export const HotkeyField = ({
   t: Translate;
   value: string;
   label: string;
-  onRecorded: (hotkey: string) => void;
+  onRecorded: (hotkey: string) => Promise<void>;
 }) => {
   const [recording, setRecording] = useState(false);
+  const session = useRef<{ started: Promise<void>; finishing: boolean } | null>(null);
 
-  useEffect(() => {
-    if (!recording) return;
-    invoke("set_recording_mode", { enabled: true }).catch(console.error);
-    return () => {
-      invoke("set_recording_mode", { enabled: false }).catch(console.error);
-    };
-  }, [recording]);
+  const finish = useCallback(async (commit?: () => Promise<void>) => {
+    const current = session.current;
+    if (!current || current.finishing) return;
+    current.finishing = true;
+    try {
+      await current.started;
+      await commit?.();
+    } catch (error) {
+      console.error(error);
+    } finally {
+      await invoke("set_recording_mode", { enabled: false }).catch(console.error);
+      hotkeyCaptureActive = false;
+      session.current = null;
+      setRecording(false);
+    }
+  }, []);
+
+  useEffect(() => () => { void finish(); }, [finish]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (!recording) return;
+    if (!session.current) return;
     event.preventDefault();
     event.stopPropagation();
+    if (event.repeat || session.current.finishing) return;
     if (event.key === "Escape") {
-      setRecording(false);
+      void finish();
       return;
     }
     if (event.key === "Backspace" || event.key === "Delete") {
-      onRecorded("");
-      setRecording(false);
+      void finish(() => onRecorded(""));
       return;
     }
     const key = hotkeyKeyFromEvent(event);
@@ -176,8 +188,7 @@ export const HotkeyField = ({
     if (event.shiftKey) modifiers.push("Shift");
     if (event.altKey) modifiers.push("Alt");
     if (event.metaKey) modifiers.push("Command");
-    onRecorded([...modifiers, key].join("+"));
-    setRecording(false);
+    void finish(() => onRecorded([...modifiers, key].join("+")));
   };
 
   const shown = getHotkeyDisplayTokens(value, { preferMacSymbols: true })
@@ -191,13 +202,21 @@ export const HotkeyField = ({
       tabIndex={0}
       aria-label={label}
       onClick={(event) => {
+        if (hotkeyCaptureActive) return;
+        hotkeyCaptureActive = true;
+        const started = invoke<void>("set_recording_mode", { enabled: true });
+        session.current = { started, finishing: false };
+        void started.catch(() => finish());
         setRecording(true);
         event.currentTarget.focus();
       }}
       onKeyDown={onKeyDown}
-      onBlur={() => setRecording(false)}
+      onBlur={() => void finish()}
     >
       {recording ? t("hotkey_waiting") : shown || t("hotkey_not_set")}
     </div>
   );
 };
+
+// A capture can still be finishing after Settings has been closed and reopened.
+let hotkeyCaptureActive = false;
