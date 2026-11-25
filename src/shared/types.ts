@@ -32,6 +32,10 @@ export interface FavoriteItem {
   created_at: number;
   /** Absolute paths of a media favorite. */
   paths: string[];
+  /** For lookup only, never pasted. Empty when unset. */
+  title: string;
+  /** For filtering only, never pasted. Empty when unset. */
+  tags: string[];
 }
 
 export type Locale = "zh" | "en";

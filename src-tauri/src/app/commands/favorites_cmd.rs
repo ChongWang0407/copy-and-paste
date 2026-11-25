@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use rusqlite::Connection;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -336,35 +337,92 @@ fn text_preview(content_type: &str, text: &str) -> String {
     build_entry_preview(content_type, text, None)
 }
 
-/// 常用 panel › 手动添加. Only text can be typed in.
+fn add_text(conn: &Connection, text: &str, title: &str, tags: &[String], now: i64) -> AppResult<Favorite> {
+    if text.trim().is_empty() {
+        return Err(AppError::Validation("empty".to_string()));
+    }
+    let content_type = detect_content_type(text);
+    if repo::find_text(conn, &content_type, text)?.is_some() {
+        return Err(AppError::Validation("favorite_duplicate".to_string()));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let favorite = repo::insert(
+        &tx,
+        &NewFavorite {
+            content_type: &content_type,
+            content: text,
+            html_content: None,
+            preview: &text_preview(&content_type, text),
+            source_app: "",
+        },
+        now,
+    )?;
+    repo::set_meta(&tx, &favorite, title, tags, now)?;
+    let favorite = repo::get(&tx, favorite.id)?.expect("just inserted");
+    tx.commit()?;
+    Ok(favorite)
+}
+
+fn existing(conn: &Connection, id: i64) -> AppResult<Favorite> {
+    repo::get(conn, id)?.ok_or_else(|| AppError::Validation("Item not found".to_string()))
+}
+
+/// The text is rewritten only when it changed, so a title or tag edit keeps
+/// a rich-text favorite's format. `dropping_html` runs before a rewrite.
+fn edit_text(
+    conn: &Connection,
+    id: i64,
+    text: &str,
+    title: &str,
+    tags: &[String],
+    now: i64,
+    dropping_html: impl FnOnce(&Connection, &Favorite) -> AppResult<()>,
+) -> AppResult<()> {
+    if text.trim().is_empty() {
+        return Err(AppError::Validation("empty".to_string()));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let favorite = existing(&tx, id)?;
+    if is_media(&favorite.content_type) {
+        return Err(AppError::Validation("favorite_not_text".to_string()));
+    }
+    if favorite.content != text {
+        dropping_html(&tx, &favorite)?;
+        let content_type = detect_content_type(text);
+        repo::update_text(&tx, id, &content_type, text, &text_preview(&content_type, text), now)?;
+    }
+    repo::set_meta(&tx, &favorite, title, tags, now)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn edit_meta(conn: &Connection, id: i64, title: &str, tags: &[String], now: i64) -> AppResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    let favorite = existing(&tx, id)?;
+    repo::set_meta(&tx, &favorite, title, tags, now)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 常用 panel › 手动添加. Only text can be typed in; the same text twice is refused.
 #[tauri::command]
 pub fn add_favorite_text(
     app_handle: AppHandle,
     state: State<'_, DbState>,
     text: String,
+    title: Option<String>,
+    tags: Option<Vec<String>>,
 ) -> AppResult<FavoriteView> {
-    if text.trim().is_empty() {
-        return Err(AppError::Validation("empty".to_string()));
-    }
-    let content_type = detect_content_type(&text);
-    let conn = state.conn.lock().unwrap();
-    if let Some(existing) = repo::find_text(&conn, &content_type, &text).map_err(AppError::from)? {
-        drop(conn);
-        return Ok(view(&app_handle, existing));
-    }
-    let favorite = repo::insert(
-        &conn,
-        &NewFavorite {
-            content_type: &content_type,
-            content: &text,
-            html_content: None,
-            preview: &text_preview(&content_type, &text),
-            source_app: "",
-        },
-        now_ms(),
-    )
-    .map_err(AppError::from)?;
-    drop(conn);
+    let favorite = {
+        let conn = state.conn.lock().unwrap();
+        add_text(
+            &conn,
+            &text,
+            title.as_deref().unwrap_or_default(),
+            tags.as_deref().unwrap_or_default(),
+            now_ms(),
+        )?
+    };
     notify(&app_handle);
     Ok(view(&app_handle, favorite))
 }
@@ -375,28 +433,36 @@ pub fn update_favorite_text(
     state: State<'_, DbState>,
     id: i64,
     text: String,
+    title: String,
+    tags: Vec<String>,
 ) -> AppResult<()> {
-    if text.trim().is_empty() {
-        return Err(AppError::Validation("empty".to_string()));
-    }
-    let content_type = detect_content_type(&text);
     let data_dir = app_handle.state::<AppDataDir>().0.lock().unwrap().clone();
-    let conn = state.conn.lock().unwrap();
-    let tx = conn.unchecked_transaction()?;
-    if let Some(favorite) = repo::get(&tx, id)? {
-        state.repo.queue_favorite_attachment_deletions(&tx, &data_dir, favorite.html_content.as_deref())?;
+    {
+        let conn = state.conn.lock().unwrap();
+        edit_text(&conn, id, &text, &title, &tags, now_ms(), |tx, favorite| {
+            state
+                .repo
+                .queue_favorite_attachment_deletions(tx, &data_dir, favorite.html_content.as_deref())
+                .map_err(AppError::Internal)
+        })?;
     }
-    repo::update_text(
-        &tx,
-        id,
-        &content_type,
-        &text,
-        &text_preview(&content_type, &text),
-        now_ms(),
-    )
-    .map_err(AppError::from)?;
-    tx.commit()?;
-    drop(conn);
+    notify(&app_handle);
+    Ok(())
+}
+
+/// Title and tags only: the content, format and files stay as they are.
+#[tauri::command]
+pub fn update_favorite_meta(
+    app_handle: AppHandle,
+    state: State<'_, DbState>,
+    id: i64,
+    title: String,
+    tags: Vec<String>,
+) -> AppResult<()> {
+    {
+        let conn = state.conn.lock().unwrap();
+        edit_meta(&conn, id, &title, &tags, now_ms())?;
+    }
     notify(&app_handle);
     Ok(())
 }
@@ -454,6 +520,179 @@ pub async fn paste_favorite(
         favorite.html_content.as_deref(),
     )
     .await
+}
+
+#[cfg(test)]
+mod meta_tests {
+    use super::{add_text, edit_meta, edit_text};
+    use crate::infrastructure::repository::favorites_repo::{self as repo, NewFavorite};
+    use rusqlite::Connection;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::infrastructure::repository::migrations::run_migrations(&conn).unwrap();
+        conn
+    }
+
+    fn tags(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn meta_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM cp_fork_favorite_meta", [], |row| row.get(0)).unwrap()
+    }
+
+    fn rich(conn: &Connection) -> repo::Favorite {
+        repo::insert(
+            conn,
+            &NewFavorite {
+                content_type: "rich_text",
+                content: "bold",
+                html_content: Some("<b>bold</b>"),
+                preview: "bold",
+                source_app: "Pages",
+            },
+            10,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn adding_keeps_title_and_tags_and_refuses_the_same_text() {
+        let conn = db();
+        let saved = add_text(&conn, "hello", " Greeting ", &tags(&["work"]), 1).unwrap();
+        assert_eq!(saved.title, "Greeting");
+        assert_eq!(saved.tags, ["work"]);
+        let error = add_text(&conn, "hello", "", &[], 2).unwrap_err().to_string();
+        assert!(error.contains("favorite_duplicate"), "{error}");
+        assert_eq!(repo::list(&conn).unwrap().len(), 1);
+        assert!(add_text(&conn, "  ", "", &[], 3).is_err());
+    }
+
+    #[test]
+    fn title_and_tag_edits_keep_the_rich_format() {
+        let conn = db();
+        let favorite = rich(&conn);
+        let mut dropped = false;
+        edit_text(&conn, favorite.id, "bold", "Title", &tags(&["a"]), 11, |_, _| {
+            dropped = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!dropped);
+        let edited = repo::get(&conn, favorite.id).unwrap().unwrap();
+        assert_eq!(edited.content_type, "rich_text");
+        assert_eq!(edited.html_content.as_deref(), Some("<b>bold</b>"));
+        assert_eq!((edited.title.as_str(), edited.tags.clone()), ("Title", tags(&["a"])));
+        let updated_at: i64 = conn
+            .query_row("SELECT updated_at FROM favorites WHERE id = ?1", [favorite.id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(updated_at, 10, "the favorites row is not touched");
+
+        edit_text(&conn, favorite.id, "plain now", "Title", &tags(&["a"]), 12, |_, old| {
+            dropped = old.html_content.is_some();
+            Ok(())
+        })
+        .unwrap();
+        assert!(dropped);
+        let edited = repo::get(&conn, favorite.id).unwrap().unwrap();
+        assert_eq!((edited.content_type.as_str(), edited.html_content), ("text", None));
+        assert_eq!(edited.title, "Title");
+    }
+
+    #[test]
+    fn media_takes_titles_and_tags_but_never_text() {
+        let conn = db();
+        let image = repo::insert(
+            &conn,
+            &NewFavorite { content_type: "image", content: "f/a.png", html_content: None, preview: "Image", source_app: "" },
+            5,
+        )
+        .unwrap();
+        let error = edit_text(&conn, image.id, "text", "", &[], 6, |_, _| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("favorite_not_text"));
+        edit_meta(&conn, image.id, "Logo", &tags(&["brand"]), 7).unwrap();
+        let edited = repo::get(&conn, image.id).unwrap().unwrap();
+        assert_eq!((edited.content.as_str(), edited.title.as_str()), ("f/a.png", "Logo"));
+        // Clearing both leaves no row behind.
+        edit_meta(&conn, image.id, " ", &tags(&[" "]), 8).unwrap();
+        assert_eq!(meta_rows(&conn), 0);
+        assert!(edit_meta(&conn, 999, "x", &[], 9).is_err());
+        assert_eq!(meta_rows(&conn), 0, "no row for a missing favorite");
+    }
+
+    #[test]
+    fn titles_and_tags_are_normalized() {
+        let conn = db();
+        let long_tag = "标".repeat(30);
+        let mut many = tags(&[" Prompt ", "", "prompt", "PROMPT", "  ", "😀😀"]);
+        many.push(long_tag);
+        many.extend((0..10).map(|n| format!("t{n}")));
+        let saved = add_text(&conn, "x", &format!("  {}  ", "长".repeat(100)), &many, 1).unwrap();
+        assert_eq!(saved.title.chars().count(), 80);
+        assert_eq!(saved.tags.len(), 8);
+        assert_eq!(&saved.tags[..3], ["Prompt", "😀😀", &"标".repeat(24)]);
+        assert_eq!(saved.tags[3], "t0");
+        assert_eq!(repo::normalize_title(&format!("{}  b", "a".repeat(79))), "a".repeat(79));
+    }
+
+    #[test]
+    fn stale_rows_are_ignored_and_deleted_and_deletes_cascade() {
+        let conn = db();
+        let favorite = rich(&conn);
+        conn.execute(
+            "INSERT INTO cp_fork_favorite_meta (favorite_id, favorite_created_at, title, tags, updated_at)
+             VALUES (?1, 999, 'old', '[\"old\"]', 1)",
+            [favorite.id],
+        )
+        .unwrap();
+        let listed = repo::list(&conn).unwrap();
+        assert_eq!((listed[0].title.as_str(), listed[0].tags.len()), ("", 0));
+        assert_eq!(meta_rows(&conn), 0);
+
+        edit_meta(&conn, favorite.id, "Kept", &tags(&["a"]), 2).unwrap();
+        assert_eq!(meta_rows(&conn), 1);
+        let tx = conn.unchecked_transaction().unwrap();
+        repo::delete(&tx, favorite.id).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(meta_rows(&conn), 0);
+        // The next favorite may reuse the id; it starts with no title.
+        let next = add_text(&conn, "new", "", &[], 3).unwrap();
+        assert_eq!(next.title, "");
+    }
+
+    #[cfg(not(feature = "portable"))]
+    #[test]
+    fn titles_and_tags_of_an_encrypted_favorite_are_encrypted() {
+        use crate::infrastructure::encryption;
+        let conn = db();
+        let secret = repo::insert_with_protection(
+            &conn,
+            &NewFavorite { content_type: "text", content: "secret", html_content: None, preview: "secret", source_app: "" },
+            1,
+            true,
+        )
+        .unwrap();
+        edit_text(&conn, secret.id, "secret", "Bank", &tags(&["pin"]), 2, |_, _| Ok(())).unwrap();
+        let (title, stored_tags): (String, String) = conn
+            .query_row("SELECT title, tags FROM cp_fork_favorite_meta", [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        assert!(encryption::is_modern_ciphertext(&title));
+        assert!(encryption::is_modern_ciphertext(&stored_tags));
+        let read = repo::get(&conn, secret.id).unwrap().unwrap();
+        assert_eq!((read.title.as_str(), read.tags.clone()), ("Bank", tags(&["pin"])));
+
+        // A plain favorite that later turns sensitive takes its title along.
+        let plain = add_text(&conn, "later", "Visible", &tags(&["x"]), 3).unwrap();
+        let mut found = repo::find_text(&conn, "text", "later").unwrap().unwrap();
+        assert_eq!(found.title, "Visible");
+        repo::protect(&conn, &mut found).unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM cp_fork_favorite_meta WHERE favorite_id = ?1", [plain.id], |row| row.get(0))
+            .unwrap();
+        assert!(encryption::is_modern_ciphertext(&title));
+        assert_eq!(repo::get(&conn, plain.id).unwrap().unwrap().title, "Visible");
+    }
 }
 
 #[cfg(test)]
@@ -536,6 +775,8 @@ mod tests {
             sort_order: 1,
             created_at: 0,
             is_encrypted: false,
+            title: String::new(),
+            tags: Vec::new(),
         };
         remove_files(&dir, &favorite);
         assert!(!dir.join(&stored).exists());

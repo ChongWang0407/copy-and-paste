@@ -146,6 +146,7 @@ fn main() -> AppResult<()> {
             app::commands::add_favorite_from_entry,
             app::commands::add_favorite_text,
             app::commands::update_favorite_text,
+            app::commands::update_favorite_meta,
             app::commands::delete_favorite,
             app::commands::reorder_favorites,
             app::commands::paste_favorite,

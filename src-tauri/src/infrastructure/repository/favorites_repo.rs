@@ -18,6 +18,9 @@ pub struct Favorite {
     pub created_at: i64,
     #[serde(skip)]
     pub is_encrypted: bool,
+    /// For lookup only, never pasted. Empty when unset.
+    pub title: String,
+    pub tags: Vec<String>,
 }
 
 pub struct NewFavorite<'a> {
@@ -28,7 +31,35 @@ pub struct NewFavorite<'a> {
     pub source_app: &'a str,
 }
 
-const COLUMNS: &str = "id, content_type, content, html_content, preview, source_app, sort_order, created_at, is_encrypted";
+const COLUMNS: &str = "f.id, f.content_type, f.content, f.html_content, f.preview, f.source_app, f.sort_order,
+    f.created_at, f.is_encrypted, COALESCE(m.title, ''), COALESCE(m.tags, '[]')";
+/// A meta row counts only while its favorite's creation time matches: another
+/// build may have deleted the favorite and SQLite may reuse the id.
+const FROM: &str = "favorites f LEFT JOIN cp_fork_favorite_meta m
+    ON m.favorite_id = f.id AND m.favorite_created_at = f.created_at";
+
+pub const MAX_TITLE_CHARS: usize = 80;
+pub const MAX_TAG_CHARS: usize = 24;
+pub const MAX_TAGS: usize = 8;
+
+/// Trim, then cut to `max` code points.
+fn clip(value: &str, max: usize) -> String {
+    value.trim().chars().take(max).collect::<String>().trim_end().to_string()
+}
+
+pub fn normalize_title(title: &str) -> String {
+    clip(title, MAX_TITLE_CHARS)
+}
+
+/// No empties; the first spelling of a case-insensitive repeat wins.
+pub fn normalize_tags(tags: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    tags.iter()
+        .map(|tag| clip(tag, MAX_TAG_CHARS))
+        .filter(|tag| !tag.is_empty() && seen.insert(tag.to_lowercase()))
+        .take(MAX_TAGS)
+        .collect()
+}
 
 fn crypto_error(error: String) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
@@ -45,33 +76,70 @@ fn from_row(row: &Row<'_>) -> Result<Favorite> {
         sort_order: row.get(6)?,
         created_at: row.get(7)?,
         is_encrypted: row.get(8)?,
+        title: row.get(9)?,
+        tags: Vec::new(),
     };
+    let mut tags: String = row.get(10)?;
     if favorite.is_encrypted {
         let decode = |value: &str| encryption::decrypt_stored_value(value).map_err(crypto_error);
         favorite.content = decode(&favorite.content)?;
         favorite.preview = decode(&favorite.preview)?;
         favorite.html_content = favorite.html_content.as_deref().map(decode).transpose()?;
+        favorite.title = decode(&favorite.title)?;
+        tags = decode(&tags)?;
     }
+    // Unreadable tags are dropped rather than hiding the favorite.
+    favorite.tags = serde_json::from_str(&tags).unwrap_or_default();
     Ok(favorite)
 }
 
 pub fn list(conn: &Connection) -> Result<Vec<Favorite>> {
-    let sql = format!("SELECT {COLUMNS} FROM favorites ORDER BY sort_order ASC, id ASC");
+    conn.execute(
+        "DELETE FROM cp_fork_favorite_meta WHERE NOT EXISTS (SELECT 1 FROM favorites f
+         WHERE f.id = favorite_id AND f.created_at = favorite_created_at)",
+        [],
+    )?;
+    let sql = format!("SELECT {COLUMNS} FROM {FROM} ORDER BY f.sort_order ASC, f.id ASC");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], from_row)?;
     rows.collect()
 }
 
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Favorite>> {
-    let sql = format!("SELECT {COLUMNS} FROM favorites WHERE id = ?1");
+    let sql = format!("SELECT {COLUMNS} FROM {FROM} WHERE f.id = ?1");
     conn.query_row(&sql, params![id], from_row).optional()
+}
+
+/// Title and tags, normalized and encrypted like the favorite's content.
+/// Nothing left to keep removes the row.
+pub fn set_meta(conn: &Connection, favorite: &Favorite, title: &str, tags: &[String], now: i64) -> Result<()> {
+    let title = normalize_title(title);
+    let tags = normalize_tags(tags);
+    if title.is_empty() && tags.is_empty() {
+        conn.execute("DELETE FROM cp_fork_favorite_meta WHERE favorite_id = ?1", [favorite.id])?;
+        return Ok(());
+    }
+    let json = serde_json::to_string(&tags).map_err(|error| crypto_error(error.to_string()))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO cp_fork_favorite_meta
+            (favorite_id, favorite_created_at, title, tags, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            favorite.id,
+            favorite.created_at,
+            storage_value(&title, favorite.is_encrypted)?,
+            storage_value(&json, favorite.is_encrypted)?,
+            now
+        ],
+    )?;
+    Ok(())
 }
 
 /// Text already kept: adding it again keeps the one entry.
 pub fn find_text(conn: &Connection, content_type: &str, content: &str) -> Result<Option<Favorite>> {
     let sql = format!(
-        "SELECT {COLUMNS} FROM favorites WHERE content_type = ?1
-        AND (content = ?2 OR is_encrypted = 1) ORDER BY is_encrypted DESC, id"
+        "SELECT {COLUMNS} FROM {FROM} WHERE f.content_type = ?1
+        AND (f.content = ?2 OR f.is_encrypted = 1) ORDER BY f.is_encrypted DESC, f.id"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![content_type, content], from_row)?;
@@ -117,7 +185,10 @@ pub fn insert_with_protection(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
         params![new.content_type, content, html, preview, new.source_app, order, now, protected],
     )?;
-    Ok(get(conn, conn.last_insert_rowid())?.expect("just inserted"))
+    let id = conn.last_insert_rowid();
+    // A reused id must not inherit a deleted favorite's title and tags.
+    conn.execute("DELETE FROM cp_fork_favorite_meta WHERE favorite_id = ?1", [id])?;
+    Ok(get(conn, id)?.expect("just inserted"))
 }
 
 pub fn protect(conn: &Connection, favorite: &mut Favorite) -> Result<()> {
@@ -132,6 +203,10 @@ pub fn protect(conn: &Connection, favorite: &mut Favorite) -> Result<()> {
             params![storage_value(&favorite.content, true)?, storage_value(&favorite.preview, true)?, html, favorite.id],
         )?;
         favorite.is_encrypted = true;
+        if !favorite.title.is_empty() || !favorite.tags.is_empty() {
+            let (title, tags) = (favorite.title.clone(), favorite.tags.clone());
+            set_meta(conn, favorite, &title, &tags, chrono::Utc::now().timestamp_millis())?;
+        }
     }
     Ok(())
 }
@@ -168,8 +243,8 @@ pub(crate) fn repair_sensitive_favorites(conn: &Connection) -> Result<()> {
     }
     let favorites = {
         let mut stmt = tx.prepare(&format!(
-            "SELECT {COLUMNS} FROM favorites WHERE is_encrypted = 0
-             AND content_type IN ('text', 'rich_text', 'code', 'url')"
+            "SELECT {COLUMNS} FROM {FROM} WHERE f.is_encrypted = 0
+             AND f.content_type IN ('text', 'rich_text', 'code', 'url')"
         ))?;
         let rows = stmt.query_map([], from_row)?;
         rows.collect::<Result<Vec<_>>>()?
@@ -239,8 +314,10 @@ pub fn update_text(
     Ok(())
 }
 
+/// Run it in a transaction: the favorite and its title and tags go together.
 pub fn delete(conn: &Connection, id: i64) -> Result<()> {
     conn.execute("DELETE FROM favorites WHERE id = ?1", params![id])?;
+    conn.execute("DELETE FROM cp_fork_favorite_meta WHERE favorite_id = ?1", params![id])?;
     Ok(())
 }
 
