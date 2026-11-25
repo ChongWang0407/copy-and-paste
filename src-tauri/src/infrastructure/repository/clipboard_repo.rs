@@ -112,6 +112,18 @@ impl ClipboardSortMode {
     }
 }
 
+/// An entry as the user saw it when confirming a deletion.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmedEntry {
+    pub id: i64,
+    pub created_at: i64,
+    pub is_pinned: bool,
+}
+
+/// Error code: the confirmed entries are no longer what is stored.
+pub const SELECTION_CHANGED: &str = "selection_changed";
+
 pub fn matches_type(entry: &ClipboardEntry, filter: Option<&str>) -> bool {
     filter.is_none_or(|kind| entry.content_type == kind || (kind == "text" && entry.content_type == "rich_text"))
 }
@@ -859,6 +871,55 @@ impl SqliteClipboardRepository {
         self.delete_entries(&conn, &[id], data_dir, now_ms() + 120_000)
     }
 
+    /// Deletes rows only while each is still the entry the user confirmed:
+    /// same ID (SQLite can reuse the highest one), same capture time, same pin
+    /// state. All or nothing, in one transaction; returns the rows deleted.
+    pub fn delete_confirmed(
+        &self,
+        entries: &[ConfirmedEntry],
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<usize, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        for entry in entries {
+            let current = tx
+                .query_row(
+                    "SELECT created_at, is_pinned FROM clipboard_history WHERE id = ?",
+                    [entry.id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if current != Some((entry.created_at, entry.is_pinned)) {
+                return Err(SELECTION_CHANGED.to_string());
+            }
+        }
+        let ids: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+        let deleted = self.delete_entries_in(&tx, &ids, data_dir, now_ms())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(deleted)
+    }
+
+    /// What a selection refers to now: ID, capture time and pin state of the
+    /// rows that still exist.
+    pub fn entry_states(&self, ids: &[i64]) -> Result<Vec<ConfirmedEntry>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare_cached("SELECT created_at, is_pinned FROM clipboard_history WHERE id = ?")
+            .map_err(|e| e.to_string())?;
+        let mut states = Vec::new();
+        for &id in ids {
+            let state = stmt
+                .query_row([id], |row| {
+                    Ok(ConfirmedEntry { id, created_at: row.get(0)?, is_pinned: row.get(1)? })
+                })
+                .optional()
+                .map_err(|e| e.to_string())?;
+            states.extend(state);
+        }
+        Ok(states)
+    }
+
     fn delete_entries(
         &self,
         conn: &Connection,
@@ -867,6 +928,21 @@ impl SqliteClipboardRepository {
         deadline: i64,
     ) -> Result<(), String> {
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        self.delete_entries_in(&tx, ids, data_dir, deadline)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// The deletion itself, inside the caller's transaction. Files are only
+    /// queued for the sweep, which checks history, favorites and session
+    /// references before removing any.
+    fn delete_entries_in(
+        &self,
+        tx: &Connection,
+        ids: &[i64],
+        data_dir: Option<&std::path::Path>,
+        deadline: i64,
+    ) -> Result<usize, String> {
+        let mut deleted = 0;
         let mut files = Vec::new();
         let mut all_readable = true;
         let attachments = data_dir.map(|dir| dir.join("attachments"));
@@ -903,15 +979,16 @@ impl SqliteClipboardRepository {
                     }
                 }
             }
-            tx.execute("DELETE FROM clipboard_history WHERE id = ?", [id])
+            deleted += tx
+                .execute("DELETE FROM clipboard_history WHERE id = ?", [id])
                 .map_err(|e| e.to_string())?;
             tx.execute("DELETE FROM entry_tags WHERE entry_id = ?", [id])
                 .map_err(|e| e.to_string())?;
         }
         if all_readable {
-            Self::queue_attachment_deletions(&tx, &files, deadline)?;
+            Self::queue_attachment_deletions(tx, &files, deadline)?;
         }
-        tx.commit().map_err(|e| e.to_string())
+        Ok(deleted)
     }
 
     fn queue_attachment_deletions(

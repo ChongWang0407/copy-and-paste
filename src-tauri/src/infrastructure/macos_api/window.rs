@@ -538,6 +538,9 @@ pub fn hide_clipboard_panel(app: &AppHandle) -> bool {
                         .into(),
                 );
                 eprintln!("[macos-overlay] panel.hide() gen={gen}");
+                // The page stops its timers until the next clipboard-shown.
+                use tauri::Emitter;
+                let _ = app_for_panel.emit("clipboard-hidden", ());
             }
         })
         .is_ok();

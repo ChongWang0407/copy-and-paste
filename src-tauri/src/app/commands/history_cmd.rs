@@ -1,11 +1,14 @@
-use crate::app_state::{AppDataDir, SessionHistory};
+use crate::app_state::{AppDataDir, PasteQueue, SessionHistory};
 use crate::database::DbState;
 use crate::domain::models::ClipboardEntry;
 use crate::error::{AppError, AppResult};
-use crate::infrastructure::repository::clipboard_repo::{matches_type, ClipboardRepository, ClipboardSortMode};
+use crate::infrastructure::repository::clipboard_repo::{
+    matches_type, ClipboardRepository, ClipboardSortMode, ConfirmedEntry, SqliteClipboardRepository,
+    SELECTION_CHANGED,
+};
 use crate::infrastructure::repository::tag_repo::TagRepository;
 use crate::services::clipboard::entry_matches_search;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use tauri::{AppHandle, Emitter, State};
 
 fn validate_and_repair_external_media(item: &mut ClipboardEntry, data_dir: &std::path::Path) {
@@ -200,6 +203,191 @@ mod merged_page_tests {
     }
 }
 
+#[cfg(test)]
+mod delete_selection_tests {
+    use super::{delete_selection, ClipboardEntry, ConfirmedEntry, SELECTION_CHANGED};
+    use crate::infrastructure::repository::clipboard_repo::SqliteClipboardRepository;
+    use crate::infrastructure::repository::migrations::run_migrations;
+    use rusqlite::Connection;
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    struct Fixture {
+        root: PathBuf,
+        conn: Arc<Mutex<Connection>>,
+        repo: SqliteClipboardRepository,
+        session: VecDeque<ClipboardEntry>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("copypaste-batch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join("attachments")).unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            run_migrations(&conn).unwrap();
+            let conn = Arc::new(Mutex::new(conn));
+            Self {
+                root,
+                repo: SqliteClipboardRepository::new(conn.clone()),
+                conn,
+                session: VecDeque::new(),
+            }
+        }
+
+        fn attachment(&self, name: &str) -> PathBuf {
+            let path = self.root.join("attachments").join(name);
+            std::fs::write(&path, b"attachment").unwrap();
+            path
+        }
+
+        fn row(&self, id: Option<i64>, created_at: i64, image: Option<&Path>) -> i64 {
+            let conn = self.conn.lock().unwrap();
+            let (kind, content, external) = match image {
+                Some(path) => ("image", path.to_string_lossy().into_owned(), 1),
+                None => ("text", format!("text {created_at}"), 0),
+            };
+            conn.execute(
+                "INSERT INTO clipboard_history
+                     (id, content_type, content, source_app, timestamp, sort_at, created_at, preview, is_external)
+                 VALUES (?1, ?2, ?3, 'Test', ?4, ?4, ?4, 'preview', ?5)",
+                rusqlite::params![id, kind, content, created_at, external],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        }
+
+        fn session_entry(&mut self, id: i64, created_at: i64) {
+            self.session.push_back(
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "content_type": "text", "content": "session", "source_app": "Test",
+                    "timestamp": created_at, "created_at": created_at, "sort_at": created_at,
+                    "preview": "session", "is_pinned": false,
+                }))
+                .unwrap(),
+            );
+        }
+
+        fn ids(&self) -> Vec<i64> {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT id FROM clipboard_history ORDER BY id").unwrap();
+            let ids = stmt.query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+            ids
+        }
+
+        fn delete(&mut self, items: &[ConfirmedEntry]) -> crate::error::AppResult<usize> {
+            delete_selection(&self.repo, &mut self.session, items, &self.root)
+        }
+
+        fn sweep(&self) {
+            let conn = self.conn.lock().unwrap();
+            self.repo
+                .sweep_attachment_deletions(&conn, &self.root, Vec::new(), self.session.iter())
+                .unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn confirmed(id: i64, created_at: i64) -> ConfirmedEntry {
+        ConfirmedEntry { id, created_at, is_pinned: false }
+    }
+
+    #[test]
+    fn a_failing_row_keeps_the_whole_batch() {
+        let mut fixture = Fixture::new();
+        let image = fixture.attachment("img_1.png");
+        fixture.row(Some(1), 10, Some(&image));
+        fixture.row(Some(2), 20, None);
+        fixture.row(Some(3), 30, None);
+        fixture.session_entry(-5, 40);
+        // Row 3 fails mid-transaction, after rows 1 and 2 were deleted.
+        fixture.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_delete BEFORE DELETE ON clipboard_history WHEN old.id = 3
+             BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END;",
+        ).unwrap();
+
+        let result = fixture.delete(&[confirmed(-5, 40), confirmed(1, 10), confirmed(2, 20), confirmed(3, 30)]);
+        assert!(result.is_err());
+        assert_eq!(fixture.ids(), vec![1, 2, 3]);
+        assert_eq!(fixture.session.len(), 1);
+        fixture.sweep();
+        assert!(image.exists());
+    }
+
+    #[test]
+    fn a_reused_id_fails_the_batch_and_the_new_entry_survives() {
+        let mut fixture = Fixture::new();
+        fixture.row(Some(1), 10, None);
+        fixture.row(Some(2), 20, None);
+        fixture.row(Some(3), 30, None);
+        // Confirmed: entries 2 and 3 (the highest ID). Meanwhile 3 is deleted
+        // and the next copy gets its ID back.
+        let selection = [confirmed(2, 20), confirmed(3, 30)];
+        fixture.conn.lock().unwrap().execute("DELETE FROM clipboard_history WHERE id = 3", []).unwrap();
+        assert_eq!(fixture.row(None, 50, None), 3);
+
+        let error = fixture.delete(&selection).unwrap_err().to_string();
+        assert!(error.contains(SELECTION_CHANGED), "{error}");
+        assert_eq!(fixture.ids(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_changed_pin_or_missing_entry_fails_the_batch() {
+        let mut fixture = Fixture::new();
+        fixture.row(Some(1), 10, None);
+        fixture.row(Some(2), 20, None);
+        fixture.session_entry(-7, 70);
+        fixture.conn.lock().unwrap().execute("UPDATE clipboard_history SET is_pinned = 1 WHERE id = 2", []).unwrap();
+
+        let pinned_changed = fixture.delete(&[confirmed(1, 10), confirmed(2, 20)]).unwrap_err();
+        assert!(pinned_changed.to_string().contains(SELECTION_CHANGED));
+        let missing = fixture.delete(&[confirmed(1, 10), confirmed(9, 90)]).unwrap_err();
+        assert!(missing.to_string().contains(SELECTION_CHANGED));
+        let session_gone = fixture.delete(&[confirmed(1, 10), confirmed(-8, 70)]).unwrap_err();
+        assert!(session_gone.to_string().contains(SELECTION_CHANGED));
+        assert_eq!(fixture.ids(), vec![1, 2]);
+        assert_eq!(fixture.session.len(), 1);
+
+        let pinned = ConfirmedEntry { id: 2, created_at: 20, is_pinned: true };
+        assert_eq!(fixture.delete(&[confirmed(1, 10), pinned, confirmed(-7, 70)]).unwrap(), 3);
+        assert!(fixture.ids().is_empty());
+        assert!(fixture.session.is_empty());
+    }
+
+    #[test]
+    fn attachments_go_only_when_nothing_else_references_them() {
+        let mut fixture = Fixture::new();
+        let alone = fixture.attachment("img_1.png");
+        let kept_by_history = fixture.attachment("img_2.png");
+        let kept_by_favorite = fixture.attachment("img_3.png");
+        fixture.row(Some(1), 10, Some(&alone));
+        fixture.row(Some(2), 20, Some(&kept_by_history));
+        fixture.row(Some(3), 30, Some(&kept_by_history));
+        fixture.row(Some(4), 40, Some(&kept_by_favorite));
+        fixture.conn.lock().unwrap().execute(
+            "INSERT INTO favorites (content_type, content, html_content, sort_order, created_at, updated_at)
+             VALUES ('rich_text', 'body', ?1, 1, 1, 1)",
+            [format!("<img src=\"file://{}\">", kept_by_favorite.display())],
+        ).unwrap();
+
+        // The same entry twice counts once; the count is what was deleted.
+        let deleted = fixture
+            .delete(&[confirmed(1, 10), confirmed(2, 20), confirmed(4, 40), confirmed(4, 40)])
+            .unwrap();
+        assert_eq!(deleted, 3);
+        fixture.sweep();
+        assert!(!alone.exists());
+        assert!(kept_by_history.exists());
+        assert!(kept_by_favorite.exists());
+        assert_eq!(fixture.ids(), vec![3]);
+    }
+}
+
 // async: off the main thread. A search reads every row of a large history
 // (0.1-0.2 s at 100k entries) and froze typing and scrolling meanwhile.
 #[tauri::command(async)]
@@ -283,6 +471,103 @@ pub fn delete_clipboard_entry(
     crate::services::clipboard::sweep_session_files(&app_handle);
     let _ = app_handle.emit("clipboard-changed", ());
     Ok(())
+}
+
+/// Deletes a confirmed selection as one change. Database rows go in one
+/// transaction; session entries are removed only after it committed, so a
+/// failure leaves everything (rows, session entries, files) in place.
+pub(crate) fn delete_selection(
+    repo: &SqliteClipboardRepository,
+    session: &mut VecDeque<ClipboardEntry>,
+    items: &[ConfirmedEntry],
+    data_dir: &std::path::Path,
+) -> AppResult<usize> {
+    let mut seen = HashSet::new();
+    let items: Vec<ConfirmedEntry> = items
+        .iter()
+        .filter(|item| item.id != 0 && seen.insert(item.id))
+        .copied()
+        .collect();
+    let changed = || AppError::Validation(SELECTION_CHANGED.to_string());
+    for item in items.iter().filter(|item| item.id < 0) {
+        let current = session.iter().find(|entry| entry.id == item.id).ok_or_else(changed)?;
+        if current.created_at != item.created_at || current.is_pinned != item.is_pinned {
+            return Err(changed());
+        }
+    }
+    let stored: Vec<ConfirmedEntry> = items.iter().filter(|item| item.id > 0).copied().collect();
+    let mut deleted = if stored.is_empty() {
+        0
+    } else {
+        repo.delete_confirmed(&stored, Some(data_dir)).map_err(|error| {
+            if error == SELECTION_CHANGED {
+                changed()
+            } else {
+                AppError::Database(error)
+            }
+        })?
+    };
+    let session_entries = |items: &VecDeque<ClipboardEntry>| items.iter().filter(|entry| entry.id < 0).count();
+    let before = session_entries(session);
+    // Positive IDs too: a legacy in-memory copy of a stored entry goes with it.
+    session.retain(|entry| !seen.contains(&entry.id));
+    deleted += before - session_entries(session);
+    Ok(deleted)
+}
+
+/// 批量删除. `items` is the selection frozen when the user confirmed; any entry
+/// that changed since (deleted, its ID reused, pinned or unpinned) fails the
+/// whole call with `selection_changed`. Returns how many entries were deleted.
+#[tauri::command(async)]
+pub fn delete_clipboard_entries(
+    app_handle: AppHandle,
+    state: State<'_, DbState>,
+    session: State<'_, SessionHistory>,
+    app_data: State<'_, AppDataDir>,
+    paste_queue: State<'_, PasteQueue>,
+    items: Vec<ConfirmedEntry>,
+) -> AppResult<usize> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let data_dir = app_data.0.lock().unwrap().clone();
+    let deleted = {
+        let mut session_items = session.0.lock().unwrap();
+        delete_selection(&state.repo, &mut session_items, &items, &data_dir)?
+    };
+    // The sequential paste queue reads entries by ID too.
+    {
+        let ids: HashSet<i64> = items.iter().map(|item| item.id).collect();
+        paste_queue.0.lock().unwrap().items.retain(|id| !ids.contains(id));
+    }
+    crate::services::clipboard::sweep_session_files(&app_handle);
+    let _ = app_handle.emit("clipboard-changed", ());
+    Ok(deleted)
+}
+
+/// The current ID, capture time and pin state of entries that still exist,
+/// so a selection that changed can be brought up to date.
+#[tauri::command(async)]
+pub fn get_clipboard_entry_states(
+    state: State<'_, DbState>,
+    session: State<'_, SessionHistory>,
+    ids: Vec<i64>,
+) -> AppResult<Vec<ConfirmedEntry>> {
+    let mut states: Vec<ConfirmedEntry> = {
+        let session_items = session.0.lock().unwrap();
+        ids.iter()
+            .filter(|id| **id < 0)
+            .filter_map(|id| session_items.iter().find(|entry| entry.id == *id))
+            .map(|entry| ConfirmedEntry {
+                id: entry.id,
+                created_at: entry.created_at,
+                is_pinned: entry.is_pinned,
+            })
+            .collect()
+    };
+    let stored: Vec<i64> = ids.into_iter().filter(|id| *id > 0).collect();
+    states.extend(state.repo.entry_states(&stored).map_err(AppError::Database)?);
+    Ok(states)
 }
 
 // async: clearing a large history takes seconds.

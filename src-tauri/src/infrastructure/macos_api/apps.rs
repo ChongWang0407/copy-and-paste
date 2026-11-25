@@ -17,8 +17,55 @@ use objc2_app_kit::{
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSDictionary, NSString};
 
-static EXECUTABLE_ICON_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
-static FILE_ICON_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+static EXECUTABLE_ICON_CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
+static FILE_ICON_CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
+
+/// Icons kept per cache; file icons are keyed by path, so without a limit the
+/// cache grew with every file ever copied.
+const ICON_CACHE_LIMIT: usize = 256;
+/// Largest icon side sent to the page: cards show icons at 16-30 pt (2x).
+const ICON_PIXELS: u32 = 64;
+
+/// Icons by key, the oldest dropped first past the limit.
+#[derive(Default)]
+struct IconCache {
+    icons: HashMap<String, Option<String>>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl IconCache {
+    fn get(&self, key: &str) -> Option<Option<String>> {
+        self.icons.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: String, icon: Option<String>) {
+        if self.icons.insert(key.clone(), icon).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > ICON_CACHE_LIMIT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.icons.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// The icon at display size. NSWorkspace icons carry up to 1024 px
+/// representations, which made each one tens to hundreds of KB of base64.
+fn shrink_icon_png(png: Vec<u8>) -> Vec<u8> {
+    let Ok(image) = image::load_from_memory_with_format(&png, image::ImageFormat::Png) else {
+        return png;
+    };
+    if image.width() <= ICON_PIXELS && image.height() <= ICON_PIXELS {
+        return png;
+    }
+    let small = image.resize(ICON_PIXELS, ICON_PIXELS, image::imageops::FilterType::Lanczos3);
+    let mut out = Vec::new();
+    match small.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png) {
+        Ok(()) => out,
+        Err(_) => png,
+    }
+}
 
 pub async fn launch_uwp_with_file(
     _package: &str,
@@ -200,7 +247,7 @@ fn image_to_data_url(image: &NSImage) -> Result<Option<String>, String> {
 
         Ok(Some(format!(
             "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(png_data.to_vec())
+            base64::engine::general_purpose::STANDARD.encode(shrink_icon_png(png_data.to_vec()))
         )))
     })
 }
@@ -252,13 +299,8 @@ pub fn get_executable_icon(executable_path: String) -> Result<Option<String>, St
         return Ok(None);
     }
 
-    let cache = EXECUTABLE_ICON_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cached) = cache
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get(&cache_key)
-        .cloned()
-    {
+    let cache = EXECUTABLE_ICON_CACHE.get_or_init(|| Mutex::new(IconCache::default()));
+    if let Some(cached) = cache.lock().map_err(|e| e.to_string())?.get(&cache_key) {
         return Ok(cached);
     }
 
@@ -276,13 +318,8 @@ pub fn get_file_icon(file_path: String) -> Result<Option<String>, String> {
         return Ok(None);
     }
 
-    let cache = FILE_ICON_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(cached) = cache
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get(&cache_key)
-        .cloned()
-    {
+    let cache = FILE_ICON_CACHE.get_or_init(|| Mutex::new(IconCache::default()));
+    if let Some(cached) = cache.lock().map_err(|e| e.to_string())?.get(&cache_key) {
         return Ok(cached);
     }
 
@@ -358,4 +395,40 @@ pub fn activate_app_by_name(name: &str) -> bool {
         }
         false
     })
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::{shrink_icon_png, IconCache, ICON_CACHE_LIMIT, ICON_PIXELS};
+
+    fn png(side: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::DynamicImage::new_rgba8(side, side)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn icons_are_sent_at_display_size() {
+        let small = image::load_from_memory(&shrink_icon_png(png(512))).unwrap();
+        assert_eq!((small.width(), small.height()), (ICON_PIXELS, ICON_PIXELS));
+        let tiny = png(32);
+        assert_eq!(shrink_icon_png(tiny.clone()), tiny);
+        assert_eq!(shrink_icon_png(b"not a png".to_vec()), b"not a png".to_vec());
+    }
+
+    #[test]
+    fn the_icon_cache_drops_the_oldest_past_its_limit() {
+        let mut cache = IconCache::default();
+        for index in 0..ICON_CACHE_LIMIT + 10 {
+            cache.insert(format!("/file/{index}"), None);
+        }
+        assert_eq!(cache.icons.len(), ICON_CACHE_LIMIT);
+        assert!(cache.get("/file/0").is_none());
+        assert!(cache.get(&format!("/file/{}", ICON_CACHE_LIMIT + 9)).is_some());
+        // Replacing a key does not count twice.
+        cache.insert(format!("/file/{}", ICON_CACHE_LIMIT + 9), Some("icon".into()));
+        assert_eq!(cache.order.len(), ICON_CACHE_LIMIT);
+    }
 }

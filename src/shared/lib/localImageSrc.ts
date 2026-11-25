@@ -28,7 +28,9 @@ export const toLocalFilePath = (rawSrc: string): string | null => {
   value = decodeUriComponentSafely(value, 2);
 
   if (/^file:/i.test(value)) {
-    value = value.replace(/^file:\/+/i, "");
+    // Only the scheme and the empty host go: "file:///Users/x" keeps its root
+    // "/" (stripping every slash turned macOS paths into relative ones).
+    value = value.replace(/^file:(\/\/(localhost)?)?/i, "");
     if (/^\/[a-zA-Z]:/.test(value)) {
       value = value.slice(1);
     }

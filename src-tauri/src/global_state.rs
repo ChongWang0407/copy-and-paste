@@ -10,7 +10,35 @@ pub static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 /// Legacy one-shot blur suppression. New code should use owner-based guards below.
 pub static IGNORE_BLUR: AtomicBool = AtomicBool::new(false);
 pub static WINDOW_PINNED: AtomicBool = AtomicBool::new(false);
-pub static CLIPBOARD_MONITOR_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Who has the clipboard monitor paused (hotkey recording, a batch paste).
+/// It stays paused until every owner has let go: one finishing first used to
+/// resume it under the other.
+static MONITOR_PAUSE_OWNERS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+pub const PAUSE_HOTKEY_RECORDING: &str = "hotkey_recording";
+pub const PAUSE_BATCH_PASTE: &str = "batch_paste";
+
+pub fn pause_clipboard_monitor(owner: &'static str) {
+    let mut owners = MONITOR_PAUSE_OWNERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !owners.contains(&owner) {
+        owners.push(owner);
+    }
+}
+
+pub fn resume_clipboard_monitor(owner: &'static str) {
+    MONITOR_PAUSE_OWNERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|held| *held != owner);
+}
+
+pub fn is_clipboard_monitor_paused() -> bool {
+    !MONITOR_PAUSE_OWNERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty()
+}
 
 static BLUR_GUARD_OWNERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -47,6 +75,26 @@ pub fn is_blur_ignored() -> bool {
 #[cfg(test)]
 mod blur_guard_tests {
     use super::*;
+
+    #[test]
+    fn monitor_stays_paused_until_every_owner_resumes() {
+        resume_clipboard_monitor(PAUSE_HOTKEY_RECORDING);
+        resume_clipboard_monitor(PAUSE_BATCH_PASTE);
+        assert!(!is_clipboard_monitor_paused());
+
+        pause_clipboard_monitor(PAUSE_BATCH_PASTE);
+        pause_clipboard_monitor(PAUSE_HOTKEY_RECORDING);
+        // Recording ends first: the batch paste still holds the pause.
+        resume_clipboard_monitor(PAUSE_HOTKEY_RECORDING);
+        assert!(is_clipboard_monitor_paused());
+        // A repeated start is the same owner, not a second hold.
+        pause_clipboard_monitor(PAUSE_HOTKEY_RECORDING);
+        pause_clipboard_monitor(PAUSE_HOTKEY_RECORDING);
+        resume_clipboard_monitor(PAUSE_HOTKEY_RECORDING);
+        assert!(is_clipboard_monitor_paused());
+        resume_clipboard_monitor(PAUSE_BATCH_PASTE);
+        assert!(!is_clipboard_monitor_paused());
+    }
 
     #[test]
     fn owner_guards_are_nested_and_idempotent() {

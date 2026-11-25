@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import { setBounded } from "./boundedCache";
 
+const SOURCE_ICON_CACHE_LIMIT = 200;
 const sourceAppIconCache = new Map<string, string | null>();
 const sourceAppIconRequests = new Map<string, Promise<string | null>>();
 
@@ -33,7 +35,7 @@ export const getSourceAppIcon = async (sourceAppPath?: string | null): Promise<s
   const request = invoke<string | null>("get_executable_icon", { executablePath: rawPath })
     .then((icon) => {
       const normalizedIcon = typeof icon === "string" && icon.trim() ? icon : null;
-      sourceAppIconCache.set(cacheKey, normalizedIcon);
+      setBounded(sourceAppIconCache, cacheKey, normalizedIcon, SOURCE_ICON_CACHE_LIMIT);
       return normalizedIcon;
     })
     .catch((error) => {

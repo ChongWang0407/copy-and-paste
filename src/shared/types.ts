@@ -50,6 +50,8 @@ export interface ConfirmDialogState {
   title: string;
   message: string;
   danger?: boolean;
+  /** The confirm button's text (清空, 恢复, 删除); 确定 when absent. */
+  confirmLabel?: string;
   onConfirm: () => void;
 }
 

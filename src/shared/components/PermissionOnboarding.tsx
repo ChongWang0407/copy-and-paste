@@ -97,6 +97,8 @@ export default function PermissionOnboarding({ ready, t, onboardingDone, onDone,
         })
         .catch(console.error);
     };
+    // Reopened by a refused paste: show the grants as they are now, not as last seen.
+    check();
     const interval = window.setInterval(check, CHECK_INTERVAL_MS);
     return () => window.clearInterval(interval);
   }, [open, stopAuthorizing]);

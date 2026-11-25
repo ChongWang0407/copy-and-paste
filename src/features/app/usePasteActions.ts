@@ -8,6 +8,24 @@ const contentFor = (entry: ClipboardEntry) => (isTextEntry(entry.content_type) ?
 
 export type PasteFormat = "original" | "plain" | "markdown";
 
+/** Thrown when an entry's full text can't be read: the list only has a shortened copy. */
+export const CONTENT_UNAVAILABLE = "content_unavailable";
+
+/** Error codes from a paste that stopped before anything was deleted, and their messages. */
+const STOPPED_PASTE_MESSAGES: Record<string, string> = {
+  [CONTENT_UNAVAILABLE]: "content_load_failed",
+  paste_target_unavailable: "paste_target_unavailable",
+  paste_keystroke_failed: "paste_keystroke_failed",
+  clipboard_snapshot_failed: "clipboard_snapshot_failed",
+  clipboard_changed_during_paste: "clipboard_changed_during_paste",
+};
+
+export const stoppedPasteMessage = (error: unknown): string | null => {
+  const text = String(error);
+  const code = Object.keys(STOPPED_PASTE_MESSAGES).find((key) => text.includes(key));
+  return code ? STOPPED_PASTE_MESSAGES[code] : null;
+};
+
 interface PasteOptions {
   t: Translate;
   pushToast: (message: string, duration?: number) => void;
@@ -25,6 +43,8 @@ export const usePasteActions = ({ t, pushToast, deleteAfterPaste, moveToTopAfter
       if (text.includes("accessibility_permission_required")) return;
       if (text.includes("ocr_no_text")) return pushToast(t("ocr_no_text"));
       if (text.includes("file_missing")) return pushToast(t("file_missing"));
+      const stopped = stoppedPasteMessage(text);
+      if (stopped) return pushToast(t(stopped), 3000);
       pushToast(t("copy_failed") + text, 3000);
     },
     [pushToast, t]

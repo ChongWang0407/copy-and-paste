@@ -32,13 +32,17 @@ export default class ErrorBoundary extends Component<{ children: ReactNode }, St
     if (!this.state.error) return this.props.children;
     const text = pickText();
     return (
-      <div className="error-boundary" role="alert">
-        <h2 className="error-boundary-title">{text.title}</h2>
-        <p className="error-boundary-body">{text.body}</p>
-        <p className="error-boundary-detail">{formatError(this.state.error, undefined, 160)}</p>
-        <button type="button" className="modal-button primary" onClick={() => window.location.reload()}>
-          {text.reload}
-        </button>
+      // The app's own empty-state layout and primary button: the error page
+      // used class names no stylesheet defines.
+      <div className="app-shell">
+        <div className="empty-state error-boundary" role="alert">
+          <p className="empty-title">{text.title}</p>
+          <p className="empty-hint error-boundary-body">{text.body}</p>
+          <p className="empty-hint error-boundary-detail">{formatError(this.state.error, undefined, 160)}</p>
+          <button type="button" className="glass-button is-primary" onClick={() => window.location.reload()}>
+            {text.reload}
+          </button>
+        </div>
       </div>
     );
   }

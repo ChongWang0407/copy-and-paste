@@ -100,6 +100,8 @@ fn main() -> AppResult<()> {
             app::commands::get_clipboard_history,
             app::commands::search_clipboard_history,
             app::commands::delete_clipboard_entry,
+            app::commands::delete_clipboard_entries,
+            app::commands::get_clipboard_entry_states,
             app::commands::clear_clipboard_history,
             app::commands::get_clipboard_content,
             app::commands::set_sequential_mode,

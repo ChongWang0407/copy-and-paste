@@ -36,7 +36,11 @@ export const useSettings = (): SettingsStore => {
         setValues(loaded);
         setReady(true);
       })
-      .catch((error) => console.error("Settings failed to load", error));
+      .catch((error) => {
+        // The defaults still give a working window; waiting left it blank.
+        console.error("Settings failed to load", error);
+        setReady(true);
+      });
   }, []);
 
   const language: Locale = useMemo(() => {

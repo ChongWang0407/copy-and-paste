@@ -125,8 +125,15 @@ async fn paste_next_step_inner(app_handle: tauri::AppHandle) {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
 
-                    // 6. Send paste keystroke
-                    crate::services::clipboard_ops::send_paste_keystroke();
+                    // 6. Send paste keystroke. If it didn't go out, nothing
+                    //    was pasted: the entry is kept.
+                    let sent = match crate::services::clipboard_ops::send_paste_keystroke() {
+                        Ok(()) => true,
+                        Err(err) => {
+                            eprintln!("[ERROR] Sequential paste keystroke failed: {err}");
+                            false
+                        }
+                    };
 
                     // Settle time
                     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -139,7 +146,9 @@ async fn paste_next_step_inner(app_handle: tauri::AppHandle) {
                             .load(std::sync::atomic::Ordering::Relaxed)
                     };
 
-                    if delete_after_paste && !is_pinned && !has_tags {
+                    if !sent {
+                        // Kept, and not counted as used.
+                    } else if delete_after_paste && !is_pinned && !has_tags {
                         {
                             let mut s = session.inner().0.lock().unwrap();
                             if let Some(pos) = s.iter().position(|i| i.id == id) {

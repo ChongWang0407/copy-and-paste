@@ -19,6 +19,10 @@ pub fn set_recording_mode(app_handle: AppHandle, enabled: bool) -> Result<(), St
 }
 
 pub(crate) fn update_recording_flags(enabled: bool) -> bool {
-    CLIPBOARD_MONITOR_PAUSED.store(enabled, Ordering::Relaxed);
+    if enabled {
+        pause_clipboard_monitor(PAUSE_HOTKEY_RECORDING);
+    } else {
+        resume_clipboard_monitor(PAUSE_HOTKEY_RECORDING);
+    }
     IS_RECORDING.swap(enabled, Ordering::SeqCst)
 }
