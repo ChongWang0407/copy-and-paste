@@ -1,8 +1,9 @@
 // Clipboard operations module
 use crate::app_state::SessionHistory;
 use crate::database::DbState;
+use crate::domain::models::EntryIdentity;
 use crate::error::{AppError, AppResult};
-use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+use crate::infrastructure::repository::clipboard_repo::{ClipboardRepository, PasteHistoryChange};
 use crate::infrastructure::repository::settings_repo::SettingsRepository;
 use crate::services::clipboard::{
     app_likely_word_processor,
@@ -15,6 +16,7 @@ use crate::services::clipboard::{
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use tauri::{Emitter, Manager, State};
@@ -221,6 +223,7 @@ async fn copy_to_clipboard_inner(
     mut content_type: String,
     paste: bool,
     id: i64,
+    created_at: Option<i64>,
     delete_after_use: bool,
     paste_with_format: Option<bool>,
     move_to_top: Option<bool>,
@@ -240,11 +243,17 @@ async fn copy_to_clipboard_inner(
 
     let mut html_content: Option<String> = None;
 
-    if id != 0 {
-        (content, content_type, html_content) = entry_full(&app_handle, &state, &session, id)?;
+    let source = if id != 0 {
+        let source;
+        (content, content_type, html_content, source) =
+            entry_full(&app_handle, state, session, id, created_at)?;
+        Some(source)
     } else {
         content = with_current_entry_file(&app_handle, &content_type, content);
-    }
+        None
+    };
+
+    let _paste_guard = PASTE_LOCK.lock().await;
 
     // 1. Handle Window Visibility and Focus
     if paste {
@@ -273,7 +282,7 @@ async fn copy_to_clipboard_inner(
 
     // 3. Perform paste action if requested
     if paste {
-        perform_paste_action(&app_handle, &state, id, delete_after_use, move_to_top).await?;
+        perform_paste_action(&app_handle, state, source, delete_after_use, move_to_top).await?;
     }
 
     Ok(())
@@ -296,11 +305,11 @@ pub async fn copy_to_clipboard(
     content_type: String,
     paste: bool,
     id: i64,
+    created_at: Option<i64>,
     delete_after_use: bool,
     paste_with_format: Option<bool>,
     move_to_top: Option<bool>,
 ) -> AppResult<()> {
-    let _paste_guard = PASTE_LOCK.lock().await;
     copy_to_clipboard_inner(
         app_handle,
         &state,
@@ -309,6 +318,7 @@ pub async fn copy_to_clipboard(
         content_type,
         paste,
         id,
+        created_at,
         delete_after_use,
         paste_with_format,
         move_to_top,
@@ -324,7 +334,8 @@ fn entry_full(
     state: &DbState,
     session: &SessionHistory,
     id: i64,
-) -> AppResult<(String, String, Option<String>)> {
+    created_at: Option<i64>,
+) -> AppResult<(String, String, Option<String>, EntryIdentity)> {
     let entry = if id > 0 {
         state.repo.get_entry_content_with_html(id)?
     } else {
@@ -332,24 +343,27 @@ fn entry_full(
         items
             .iter()
             .find(|item| item.id == id)
-            .map(|item| (item.content.clone(), item.content_type.clone(), item.html_content.clone()))
+            .map(|item| (item.content.clone(), item.content_type.clone(), item.html_content.clone(), item.created_at))
     };
-    let (content, kind, html) = entry.ok_or_else(|| AppError::Validation("Item not found".to_string()))?;
-    Ok((with_current_entry_file(app_handle, &kind, content), kind, html))
+    let (content, kind, html, observed_created_at) = entry
+        .filter(|entry| created_at.is_none_or(|expected| expected == entry.3))
+        .ok_or_else(|| AppError::Validation("content_unavailable".into()))?;
+    Ok((with_current_entry_file(app_handle, &kind, content), kind, html,
+        EntryIdentity { id, created_at: observed_created_at }))
 }
 
 async fn paste_plain_string(
     app_handle: &tauri::AppHandle,
     state: &DbState,
     text: &str,
-    source_id: i64,
+    source: Option<EntryIdentity>,
     delete_after_use: bool,
     move_to_top: Option<bool>,
 ) -> AppResult<()> {
     require_paste_permission(app_handle)?;
     handle_window_focus_for_paste(app_handle).await?;
     prepare_clipboard_payload(text, "text", None, false).await?;
-    perform_paste_action(app_handle, state, source_id, delete_after_use, move_to_top).await
+    perform_paste_action(app_handle, state, source, delete_after_use, move_to_top).await
 }
 
 /// Pastes content that isn't a history entry (常用). Nothing to delete or move.
@@ -364,17 +378,16 @@ pub async fn paste_stored_content(
     require_paste_permission(app_handle)?;
     handle_window_focus_for_paste(app_handle).await?;
     prepare_clipboard_payload(content, content_type, html, html.is_some()).await?;
-    perform_paste_action(app_handle, state, 0, false, Some(false)).await
+    perform_paste_action(app_handle, state, None, false, Some(false)).await
 }
 
-/// Pastes any text: an edited entry, joined batch text. `source_id` is the
-/// entry it came from, for 粘贴后自动删除 / 置顶; 0 for none.
+/// Pastes text prepared by the editor or translation panel.
 #[tauri::command]
 pub async fn paste_text(
     app_handle: tauri::AppHandle,
     state: State<'_, DbState>,
     text: String,
-    source_id: Option<i64>,
+    source: Option<EntryIdentity>,
     delete_after_use: Option<bool>,
     move_to_top: Option<bool>,
 ) -> AppResult<()> {
@@ -386,7 +399,7 @@ pub async fn paste_text(
         &app_handle,
         &state,
         &text,
-        source_id.unwrap_or(0),
+        source,
         delete_after_use.unwrap_or(false),
         move_to_top,
     )
@@ -400,17 +413,18 @@ pub async fn paste_entry_as_markdown(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
     id: i64,
+    created_at: Option<i64>,
     delete_after_use: Option<bool>,
     move_to_top: Option<bool>,
 ) -> AppResult<()> {
-    let _paste_guard = PASTE_LOCK.lock().await;
-    let (content, content_type, html) = entry_full(&app_handle, &state, &session, id)?;
+    let (content, content_type, html, source) = entry_full(&app_handle, &state, &session, id, created_at)?;
     let markdown = crate::services::markdown::entry_to_markdown(&content, &content_type, html.as_deref());
+    let _paste_guard = PASTE_LOCK.lock().await;
     paste_plain_string(
         &app_handle,
         &state,
         &markdown,
-        id,
+        Some(source),
         delete_after_use.unwrap_or(false),
         move_to_top,
     )
@@ -425,19 +439,20 @@ pub async fn paste_image_text(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
     id: i64,
+    created_at: Option<i64>,
     delete_after_use: Option<bool>,
     move_to_top: Option<bool>,
 ) -> AppResult<()> {
-    let _paste_guard = PASTE_LOCK.lock().await;
-    let text = crate::services::ocr::text_for_entry(&app_handle, &state, &session, id).await?;
+    let (text, source) = crate::services::ocr::text_for_entry(&app_handle, &state, &session, id, created_at).await?;
     if text.trim().is_empty() {
         return Err(AppError::Validation("ocr_no_text".to_string()));
     }
+    let _paste_guard = PASTE_LOCK.lock().await;
     paste_plain_string(
         &app_handle,
         &state,
         &text,
-        id,
+        Some(source),
         delete_after_use.unwrap_or(false),
         move_to_top,
     )
@@ -487,7 +502,9 @@ fn resolve_batch_steps(
     state: &DbState,
     session: &SessionHistory,
     segments: Vec<BatchSegment>,
+    sources: &[EntryIdentity],
 ) -> AppResult<Vec<BatchStep>> {
+    let sources: HashMap<_, _> = sources.iter().map(|source| (source.id, source.created_at)).collect();
     segments
         .into_iter()
         .map(|segment| match segment {
@@ -497,7 +514,10 @@ fn resolve_batch_steps(
                 html: None,
             }),
             BatchSegment::Entry { id } => {
-                let (content, content_type, html) = entry_full(app_handle, state, session, id)?;
+                let created_at = sources.get(&id).copied()
+                    .ok_or_else(|| AppError::Validation("content_unavailable".into()))?;
+                let (content, content_type, html, _) =
+                    entry_full(app_handle, state, session, id, Some(created_at))?;
                 check_payload_files(&content, &content_type)?;
                 Ok(BatchStep { content, content_type, html })
             }
@@ -520,7 +540,7 @@ fn should_restore_clipboard(wrote: bool, still_ours: bool) -> bool {
 
 /// 批量粘贴: runs the steps in order with one focus hand-off, then puts the
 /// clipboard back. The monitor is paused so no step is recorded as a new
-/// entry. `source_ids` get the usual after-paste actions, only when every
+/// entry. `sources` get the usual after-paste actions, only when every
 /// step was pasted.
 #[tauri::command]
 pub async fn paste_batch(
@@ -528,7 +548,7 @@ pub async fn paste_batch(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
     segments: Vec<BatchSegment>,
-    source_ids: Vec<i64>,
+    sources: Vec<EntryIdentity>,
     delete_after_use: Option<bool>,
     move_to_top: Option<bool>,
 ) -> AppResult<()> {
@@ -540,7 +560,7 @@ pub async fn paste_batch(
 
     // Every step and the clipboard to put back are checked first: a failure
     // here leaves the clipboard as it was.
-    let steps = resolve_batch_steps(&app_handle, &state, &session, segments)?;
+    let steps = resolve_batch_steps(&app_handle, &state, &session, segments, &sources)?;
     let previous_clipboard = capture_clipboard_snapshot()
         .ok_or_else(|| AppError::Validation("clipboard_snapshot_failed".to_string()))?;
     let pause = MonitorPause::start();
@@ -562,7 +582,7 @@ pub async fn paste_batch(
                 step.html.is_some(),
             )
             .await?;
-            ensure_paste_target_frontmost().await?;
+            ensure_paste_target_frontmost(PasteTarget::previous_app()).await?;
             send_paste_keystroke()?;
             if index + 1 < total {
                 tokio::time::sleep(std::time::Duration::from_millis(BATCH_STEP_DELAY_MS)).await;
@@ -586,16 +606,21 @@ pub async fn paste_batch(
     result?;
     restored?;
 
-    for id in source_ids {
-        handle_post_paste_actions(
+    let mut history_changed = false;
+    let result = sources.into_iter().try_for_each(|source| {
+        history_changed |= handle_post_paste_actions(
             &app_handle,
             &state,
-            id,
+            Some(source),
             delete_after_use.unwrap_or(false),
             move_to_top,
         )?;
+        Ok(())
+    });
+    if history_changed {
+        let _ = app_handle.emit("clipboard-changed", ());
     }
-    Ok(())
+    result
 }
 
 async fn handle_window_focus_for_paste(app_handle: &tauri::AppHandle) -> AppResult<()> {
@@ -617,7 +642,9 @@ async fn handle_window_focus_for_paste(app_handle: &tauri::AppHandle) -> AppResu
 
         #[cfg(target_os = "macos")]
         {
-            let activated = handoff_macos_focus_for_paste();
+            let activated = handoff_macos_focus_for_paste(
+                crate::global_state::LAST_ACTIVE_APP_PID.load(Ordering::Relaxed),
+            );
             tokio::time::sleep(std::time::Duration::from_millis(if activated {
                 60
             } else {
@@ -639,12 +666,11 @@ async fn handle_window_focus_for_paste(app_handle: &tauri::AppHandle) -> AppResu
 /// while the target remains frontmost; calling `activateWithOptions` in that
 /// state reorders/flashes the target application's windows.
 #[cfg(target_os = "macos")]
-fn handoff_macos_focus_for_paste() -> bool {
+pub(super) fn handoff_macos_focus_for_paste(prev_pid: u32) -> bool {
     if let Some(app_handle) = crate::global_state::GLOBAL_APP_HANDLE.get() {
         let _ = crate::infrastructure::macos_api::window::resign_clipboard_panel_key(app_handle);
     }
 
-    let prev_pid = crate::global_state::LAST_ACTIVE_APP_PID.load(Ordering::Relaxed);
     if prev_pid != 0 {
         let frontmost = crate::infrastructure::macos_api::window::get_active_app_snapshot();
         if frontmost.pid == prev_pid {
@@ -916,6 +942,22 @@ async fn copy_text_with_retry(content: &str) -> AppResult<()> {
 const PASTE_TARGET_WAIT_MS: u64 = 300;
 const PASTE_TARGET_POLL_MS: u64 = 20;
 
+#[derive(Clone, Copy)]
+pub(super) enum PasteTarget {
+    PreviousApp(u32),
+    ForegroundApp(u32),
+}
+
+impl PasteTarget {
+    pub(super) fn previous_app() -> Self {
+        Self::PreviousApp(crate::global_state::LAST_ACTIVE_APP_PID.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn foreground_app() -> Self {
+        Self::ForegroundApp(crate::infrastructure::macos_api::window::get_active_app_snapshot().pid)
+    }
+}
+
 /// Whether Cmd+V would reach the paste target. With no target known, any
 /// other app in front will do; the app itself never.
 fn paste_target_ready(target_pid: u32, frontmost_pid: u32, own_pid: u32) -> bool {
@@ -925,9 +967,9 @@ fn paste_target_ready(target_pid: u32, frontmost_pid: u32, own_pid: u32) -> bool
     target_pid == 0 || frontmost_pid == target_pid
 }
 
-fn paste_target_is_frontmost() -> bool {
+fn paste_target_is_frontmost(target_pid: u32) -> bool {
     paste_target_ready(
-        crate::global_state::LAST_ACTIVE_APP_PID.load(Ordering::Relaxed),
+        target_pid,
         crate::infrastructure::macos_api::window::get_active_app_snapshot().pid,
         std::process::id(),
     )
@@ -936,17 +978,23 @@ fn paste_target_is_frontmost() -> bool {
 /// The normal path is already frontmost and proceeds at once. Otherwise the
 /// hand-off is retried; a target that never comes forward stops the paste,
 /// so the keystroke can't land in another app.
-async fn ensure_paste_target_frontmost() -> AppResult<()> {
-    if paste_target_is_frontmost() {
+async fn ensure_paste_target_frontmost(target: PasteTarget) -> AppResult<()> {
+    let target_pid = match target {
+        PasteTarget::PreviousApp(pid) | PasteTarget::ForegroundApp(pid) => pid,
+    };
+    let unknown_foreground = matches!(target, PasteTarget::ForegroundApp(0));
+    if !unknown_foreground && paste_target_is_frontmost(target_pid) {
         return Ok(());
     }
-    handoff_macos_focus_for_paste();
-    let mut waited = 0;
-    while waited < PASTE_TARGET_WAIT_MS {
-        tokio::time::sleep(std::time::Duration::from_millis(PASTE_TARGET_POLL_MS)).await;
-        waited += PASTE_TARGET_POLL_MS;
-        if paste_target_is_frontmost() {
-            return Ok(());
+    if let PasteTarget::PreviousApp(pid) = target {
+        handoff_macos_focus_for_paste(pid);
+        let mut waited = 0;
+        while waited < PASTE_TARGET_WAIT_MS {
+            tokio::time::sleep(std::time::Duration::from_millis(PASTE_TARGET_POLL_MS)).await;
+            waited += PASTE_TARGET_POLL_MS;
+            if paste_target_is_frontmost(pid) {
+                return Ok(());
+            }
         }
     }
     Err(AppError::Validation("paste_target_unavailable".to_string()))
@@ -964,17 +1012,27 @@ async fn paste_and_then<T>(
     after.await
 }
 
+pub(super) async fn paste_to_target_and_then<T>(
+    target: PasteTarget,
+    after: impl std::future::Future<Output = AppResult<T>>,
+) -> AppResult<T> {
+    paste_and_then(ensure_paste_target_frontmost(target), send_paste_keystroke, after).await
+}
+
 async fn perform_paste_action(
     app_handle: &tauri::AppHandle,
     state: &DbState,
-    id: i64,
+    source: Option<EntryIdentity>,
     delete_after_use: bool,
     move_to_top: Option<bool>,
 ) -> AppResult<()> {
-    paste_and_then(ensure_paste_target_frontmost(), send_paste_keystroke, async {
+    paste_to_target_and_then(PasteTarget::previous_app(), async {
         // Hide after paste if not pinned
         hide_window_after_paste(app_handle).await;
-        handle_post_paste_actions(app_handle, state, id, delete_after_use, move_to_top)
+        if handle_post_paste_actions(app_handle, state, source, delete_after_use, move_to_top)? {
+            let _ = app_handle.emit("clipboard-changed", ());
+        }
+        Ok(())
     })
     .await
 }
@@ -1008,85 +1066,46 @@ pub fn send_paste_keystroke() -> AppResult<()> {
     Ok(())
 }
 
-fn handle_post_paste_actions(
+pub(super) fn handle_post_paste_actions(
     app_handle: &tauri::AppHandle,
     state: &DbState,
-    id: i64,
+    source: Option<EntryIdentity>,
     delete_after_use: bool,
     move_to_top: Option<bool>,
-) -> AppResult<()> {
-    if id == 0 {
-        return Ok(());
-    }
-    if delete_after_use {
-        // Fetch metadata to check for pinned or tagging protection
-        let is_protected = if id > 0 {
-            state
-                .repo
-                .get_entry_by_id(id)?
-                .is_some_and(|entry| entry.is_pinned || !entry.tags.is_empty())
-        } else {
-            let session = app_handle.state::<SessionHistory>();
-            let items = session.0.lock().unwrap();
-            items.iter().find(|entry| entry.id == id)
-                .is_some_and(|entry| entry.is_pinned || !entry.tags.is_empty())
-        };
-
-        if !is_protected {
-            // First remove from SessionHistory
-            let session = app_handle.state::<crate::app_state::SessionHistory>();
-            {
-                let mut s = session.0.lock().unwrap();
-                if let Some(pos) = s.iter().position(|i| i.id == id) {
-                    s.remove(pos);
-                }
-            }
-
-            if id > 0 {
-                // Cleanup persistent file and DB entry if needed
-                let app_data = app_handle.state::<crate::app_state::AppDataDir>();
-                let data_dir = app_data.0.lock().unwrap().clone();
-
-                if state.repo.delete_after_paste(id, Some(&data_dir)).is_ok() {
-                    let _ = app_handle.emit("clipboard-removed", id);
-                }
-            } else {
-                let _ = app_handle.emit("clipboard-removed", id);
-            }
-            return Ok(());
-        }
-    }
-    if id > 0 {
-        let _ = state.repo.increment_use_count(id);
-    }
+) -> AppResult<bool> {
+    let Some(source) = source else { return Ok(false); };
     let should_move_to_top = match move_to_top {
         Some(value) => value,
         None => state.settings_repo.get("app.move_to_top_after_paste")?.as_deref() == Some("true"),
     };
 
-    let now = Utc::now().timestamp_millis();
-    let reordered = if id > 0 {
-        should_move_to_top && state.repo.touch_entry(id, now).is_ok()
+    let change = if source.id > 0 {
+        let data_dir = delete_after_use.then(|| {
+            app_handle.state::<crate::app_state::AppDataDir>().0.lock().unwrap().clone()
+        });
+        state.repo.apply_paste_history(source, delete_after_use, should_move_to_top, data_dir.as_deref())?
     } else {
         let session = app_handle.state::<SessionHistory>();
         let mut items = session.0.lock().unwrap();
-        if let Some(entry) = items.iter_mut().find(|entry| entry.id == id) {
+        if let Some(position) = items.iter().position(|entry| source.matches(entry)) {
+            let entry = &mut items[position];
+            if delete_after_use && !entry.is_pinned && entry.tags.is_empty() {
+                items.remove(position);
+                return Ok(true);
+            }
+            let now = Utc::now().timestamp_millis();
             entry.use_count += 1;
             entry.last_used_at = now;
             if should_move_to_top {
                 entry.timestamp = now;
                 entry.sort_at = now;
             }
-            should_move_to_top
+            Some(if should_move_to_top { PasteHistoryChange::MovedToTop } else { PasteHistoryChange::Used })
         } else {
-            false
+            None
         }
     };
-    if reordered {
-        let _ = app_handle.emit("clipboard-changed", ());
-    }
-
-    Ok(())
+    Ok(matches!(change, Some(PasteHistoryChange::Deleted | PasteHistoryChange::MovedToTop)))
 }
 
 

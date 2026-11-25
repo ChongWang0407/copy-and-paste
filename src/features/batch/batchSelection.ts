@@ -1,18 +1,6 @@
 import type { ClipboardEntry, Translate } from "../../shared/types";
-
-/**
- * Which entry a selection means. The ID alone is not enough: SQLite gives a
- * deleted entry's ID to the next copy.
- */
-export interface EntryKey {
-  id: number;
-  createdAt: number;
-}
-
-export const entryKey = (entry: ClipboardEntry): EntryKey => ({ id: entry.id, createdAt: entry.created_at ?? 0 });
-
-export const isEntry = (entry: ClipboardEntry, key: EntryKey) =>
-  entry.id === key.id && (entry.created_at ?? 0) === key.createdAt;
+import { entryKey, isEntry, type EntryKey } from "../../shared/lib/clipboardTypes";
+export { entryKey, isEntry, type EntryKey } from "../../shared/lib/clipboardTypes";
 
 /** Where the entry is in the list now, or null once it is gone. */
 export const indexOfEntry = (items: ClipboardEntry[], key: EntryKey | null): number | null => {

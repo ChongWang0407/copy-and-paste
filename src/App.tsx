@@ -206,7 +206,7 @@ const App = () => {
       const open: NativeMenuItem = {
         text: t("open"),
         action: () =>
-          void invoke("open_content", { id: item.id, content: item.content, contentType: item.content_type }).catch(
+          void invoke("open_content", { ...entryKey(item), content: item.content, contentType: item.content_type }).catch(
             (error) => {
               const text = String(error);
               pushToast(text.includes("file_missing") ? t("file_missing") : t("open_failed") + text, 3000);
@@ -267,7 +267,7 @@ const App = () => {
 
   const togglePin = useCallback(
     (item: ClipboardEntry) => {
-      invoke("toggle_clipboard_pin", { id: item.id, isPinned: !item.is_pinned }).catch((error) =>
+      invoke("toggle_clipboard_pin", { ...entryKey(item), isPinned: !item.is_pinned }).catch((error) =>
         pushToast(t("pin_failed") + String(error), 3000)
       );
     },
@@ -276,8 +276,9 @@ const App = () => {
 
   const deleteEntry = useCallback(
     (item: ClipboardEntry) => {
-      removeItems([item.id]);
-      invoke("delete_clipboard_entry", { id: item.id }).catch((error) => {
+      const identity = entryKey(item);
+      removeItems([identity]);
+      invoke("delete_clipboard_entry", { ...identity }).catch((error) => {
         pushToast(t("delete_failed") + String(error), 3000);
         void refetch(true);
       });
@@ -299,7 +300,7 @@ const App = () => {
       setBatchDeleting(true);
       try {
         const count = await invoke<number>("delete_clipboard_entries", { items: frozen });
-        removeItems(frozen.map((item) => item.id));
+        removeItems(frozen);
         closeSidePanel();
         pushToast(t("batch_deleted").replace("{count}", String(count)));
       } catch (error) {
@@ -696,7 +697,7 @@ const App = () => {
           )}
           {panel.kind === "edit" && editing && (
             <EditPanel
-              key={editing.id}
+              key={`${editing.id}:${editing.created_at ?? 0}`}
               t={t}
               entry={editing}
               deleteAfterPaste={deleteAfterPaste}
@@ -708,7 +709,7 @@ const App = () => {
           )}
           {panel.kind === "translate" && editing && translationConfig && (
             <TranslatePanel
-              key={editing.id}
+              key={`${editing.id}:${editing.created_at ?? 0}`}
               t={t}
               entry={editing}
               config={translationConfig}

@@ -1,7 +1,8 @@
 use crate::app_state::{AppDataDir, SessionHistory};
 use crate::database::{self, DbState};
+use crate::domain::models::EntryIdentity;
 use crate::error::{AppError, AppResult};
-use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+use crate::infrastructure::repository::clipboard_repo::{ClipboardRepository, SELECTION_CHANGED};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 fn truncate_chars_with_suffix(text: &str, max_chars: usize, suffix: &str) -> String {
@@ -26,14 +27,18 @@ pub fn toggle_clipboard_pin(
     session: State<'_, SessionHistory>,
     app_data_dir: State<'_, AppDataDir>,
     id: i64,
+    created_at: i64,
     is_pinned: bool,
 ) -> AppResult<()> {
-    let mut real_id = id;
+    let identity = EntryIdentity { id, created_at };
+    if id > 0 && !state.repo.set_pin_if_current(identity, is_pinned)? {
+        return Err(AppError::Validation(SELECTION_CHANGED.into()));
+    }
     let mut entry_to_save = None;
 
     {
         let mut session_items = session.inner().0.lock().unwrap();
-        if let Some(item) = session_items.iter_mut().find(|i| i.id == id) {
+        if let Some(item) = session_items.iter_mut().find(|item| identity.matches(item)) {
             item.is_pinned = is_pinned;
             if id < 0 && is_pinned {
                 entry_to_save = Some(item.clone());
@@ -41,7 +46,7 @@ pub fn toggle_clipboard_pin(
         }
     }
 
-    let mut persisted_id = None;
+    let mut persisted = None;
     let pin_result = {
         // Take other locks before the connection, never while holding it.
         let data_dir = entry_to_save
@@ -54,8 +59,10 @@ pub fn toggle_clipboard_pin(
                 .repo
                 .save_with_conn(&conn, &entry, Some(&data_dir), None)
             {
-                real_id = new_id;
-                persisted_id = Some(new_id);
+                persisted = Some(EntryIdentity {
+                    id: new_id,
+                    created_at: if entry.created_at > 0 { entry.created_at } else { entry.timestamp },
+                });
                 if let Ok(deleted_ids) = state.repo.enforce_limit_with_conn(&conn, Some(&data_dir))
                 {
                     for deleted_id in deleted_ids {
@@ -65,19 +72,21 @@ pub fn toggle_clipboard_pin(
             }
         }
 
-        if real_id > 0 {
-            state.repo.toggle_pin_with_conn(&conn, real_id, is_pinned)
+        if let Some(saved) = persisted {
+            state.repo.set_pin_if_current_with_conn(&conn, saved, is_pinned)
         } else {
-            Ok(())
+            Ok(true)
         }
     };
 
-    if let Some(new_id) = persisted_id {
+    if !pin_result? {
+        return Err(AppError::Validation(SELECTION_CHANGED.into()));
+    }
+    if let Some(saved) = persisted {
         let mut session_items = session.inner().0.lock().unwrap();
         // Once persisted, the database is the sole owner of this entry.
-        session_items.retain(|item| item.id != id && item.id != new_id);
+        session_items.retain(|item| !identity.matches(item) && !saved.matches(item));
     }
-    pin_result.map_err(AppError::from)?;
 
     let _ = app_handle.emit("clipboard-changed", ());
     Ok(())
@@ -132,13 +141,18 @@ pub async fn update_item_content(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
     id: i64,
+    created_at: i64,
     new_content: String,
 ) -> AppResult<()> {
     let preview = truncate_chars_with_suffix(&new_content, 500, "...");
+    let identity = EntryIdentity { id, created_at };
+    if id > 0 && !state.repo.update_entry_content_if_current(id, created_at, &new_content, &preview)? {
+        return Err(AppError::Validation(SELECTION_CHANGED.into()));
+    }
 
     {
         let mut session_items = session.inner().0.lock().unwrap();
-        if let Some(item) = session_items.iter_mut().find(|i| i.id == id) {
+        if let Some(item) = session_items.iter_mut().find(|item| identity.matches(item)) {
             item.content = new_content.clone();
             item.preview = preview.clone();
             // Edited as plain text: the old rich format no longer matches.
@@ -146,18 +160,11 @@ pub async fn update_item_content(
             if item.content_type == "rich_text" {
                 item.content_type = "text".to_string();
             }
+        } else if id <= 0 {
+            return Err(AppError::Validation(SELECTION_CHANGED.into()));
         }
     }
 
-    if id < 0 {
-        let _ = app_handle.emit("clipboard-changed", ());
-        return Ok(());
-    }
-
-    state
-        .repo
-        .update_entry_content(id, &new_content, &preview)
-        .map_err(AppError::from)?;
     let _ = app_handle.emit("clipboard-changed", ());
     Ok(())
 }

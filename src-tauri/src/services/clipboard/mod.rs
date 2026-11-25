@@ -55,10 +55,7 @@ impl CaptureSnapshot {
         if native::change_count() != count {
             return Err(());
         }
-        if native::is_own_change(count)
-            || crate::global_state::is_clipboard_monitor_paused()
-            || native::is_clipboard_marked_private()
-        {
+        if native::is_own_change(count) || native::is_clipboard_marked_private() {
             return if native::change_count() == count {
                 Ok(None)
             } else {

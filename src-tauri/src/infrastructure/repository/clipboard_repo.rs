@@ -2,7 +2,7 @@ use crate::database::{
     calc_image_hash, calc_image_hash_from_bytes, calc_text_hash,
     has_sensitive_tag, is_text_type, save_image_bytes_to_file_with_extension, save_image_to_file,
 };
-use crate::domain::models::ClipboardEntry;
+use crate::domain::models::{ClipboardEntry, EntryIdentity};
 use crate::infrastructure::encryption;
 use crate::infrastructure::repository::settings_repo::SqliteSettingsRepository;
 use rusqlite::{params, OptionalExtension};
@@ -15,6 +15,7 @@ use urlencoding::decode;
 
 const RICH_IMAGE_FALLBACK_PREFIX: &str = "<!--CP_RICH_IMAGE:";
 const RICH_IMAGE_FALLBACK_SUFFIX: &str = "-->";
+const PASTED_ATTACHMENT_GRACE_MS: i64 = 120_000;
 
 fn decode_for_cleanup(value: &str) -> Result<std::borrow::Cow<'_, str>, String> {
     if encryption::is_encrypted_value(value) {
@@ -121,8 +122,21 @@ pub struct ConfirmedEntry {
     pub is_pinned: bool,
 }
 
+impl ConfirmedEntry {
+    pub(crate) fn identity(&self) -> EntryIdentity {
+        EntryIdentity { id: self.id, created_at: self.created_at }
+    }
+}
+
 /// Error code: the confirmed entries are no longer what is stored.
 pub const SELECTION_CHANGED: &str = "selection_changed";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PasteHistoryChange {
+    Deleted,
+    Used,
+    MovedToTop,
+}
 
 pub fn matches_type(entry: &ClipboardEntry, filter: Option<&str>) -> bool {
     filter.is_none_or(|kind| entry.content_type == kind || (kind == "text" && entry.content_type == "rich_text"))
@@ -228,7 +242,7 @@ pub trait ClipboardRepository {
     fn get_entry_content_with_html(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, Option<String>)>, String>;
+    ) -> Result<Option<(String, String, Option<String>, i64)>, String>;
 }
 
 pub struct SqliteClipboardRepository {
@@ -800,7 +814,7 @@ impl SqliteClipboardRepository {
                     is_external = ?9,
                     source_app_path = ?10,
                     use_count = use_count + 1
-                 WHERE id = ?11",
+                 WHERE id = ?11 AND created_at = ?12",
                 params![
                     entry.content_type,
                     content,
@@ -812,7 +826,8 @@ impl SqliteClipboardRepository {
                     serde_json::to_string(&cleaned_tags).unwrap_or_else(|_| "[]".to_string()),
                     if final_is_external { 1 } else { 0 },
                     entry.source_app_path.as_deref(),
-                    entry.id
+                    entry.id,
+                    entry.created_at,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -862,13 +877,65 @@ impl SqliteClipboardRepository {
         self.delete_entries(conn, &[id], data_dir, now_ms())
     }
 
-    pub fn delete_after_paste(
+    pub(crate) fn delete_if_current(
         &self,
-        id: i64,
+        entry: EntryIdentity,
         data_dir: Option<&std::path::Path>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        self.delete_entries(&conn, &[id], data_dir, now_ms() + 120_000)
+        Ok(Self::mutate_if_current(&conn, entry, |tx| {
+            self.delete_entries_in(tx, &[entry.id], data_dir, now_ms())
+        })? == Some(1))
+    }
+
+    pub(crate) fn set_pin_if_current(&self, entry: EntryIdentity, pinned: bool) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        self.set_pin_if_current_with_conn(&conn, entry, pinned)
+    }
+
+    pub(crate) fn set_pin_if_current_with_conn(
+        &self, conn: &Connection, entry: EntryIdentity, pinned: bool,
+    ) -> Result<bool, String> {
+        Ok(Self::mutate_if_current(conn, entry, |tx| {
+            self.toggle_pin_with_conn(tx, entry.id, pinned)
+        })?.is_some())
+    }
+
+    pub(crate) fn record_use_if_current(&self, entry: EntryIdentity) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE clipboard_history SET use_count = use_count + 1, last_used_at = ?1
+             WHERE id = ?2 AND created_at = ?3",
+            params![now_ms(), entry.id, entry.created_at],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Only the capture that supplied the pasted data may be changed.
+    pub(crate) fn apply_paste_history(
+        &self,
+        entry: EntryIdentity,
+        delete_after_use: bool,
+        move_to_top: bool,
+        data_dir: Option<&std::path::Path>,
+    ) -> Result<Option<PasteHistoryChange>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        Self::mutate_if_current(&conn, entry, |tx| {
+            let now = now_ms();
+            if delete_after_use && self.get_entry_by_id_with_conn(tx, entry.id)?
+                .is_some_and(|current| !current.is_pinned && current.tags.is_empty())
+            {
+                self.delete_entries_in(tx, &[entry.id], data_dir, now + PASTED_ATTACHMENT_GRACE_MS)?;
+                return Ok(PasteHistoryChange::Deleted);
+            }
+            tx.execute(
+                "UPDATE clipboard_history SET use_count = use_count + 1, last_used_at = ?1,
+                 timestamp = CASE WHEN ?3 THEN ?1 ELSE timestamp END,
+                 sort_at = CASE WHEN ?3 THEN ?1 ELSE sort_at END WHERE id = ?2",
+                params![now, entry.id, move_to_top],
+            ).map_err(|e| e.to_string())?;
+            Ok(if move_to_top { PasteHistoryChange::MovedToTop } else { PasteHistoryChange::Used })
+        })
     }
 
     /// Deletes rows only while each is still the entry the user confirmed:
@@ -1225,7 +1292,8 @@ impl SqliteClipboardRepository {
         original: &str,
         html: String,
     ) -> Result<Option<ClipboardEntry>, String> {
-        let Some(mut entry) = self.get_entry_by_id_with_conn(conn, version.id)? else {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let Some(mut entry) = self.get_entry_by_id_with_conn(&tx, version.id)? else {
             return Ok(None);
         };
         if !version.matches(&entry) || entry.html_content.as_deref() != Some(original) {
@@ -1236,11 +1304,12 @@ impl SqliteClipboardRepository {
         } else {
             encryption::encode_plain_for_storage(&html)
         };
-        conn.execute(
+        tx.execute(
             "UPDATE clipboard_history SET html_content = ?1 WHERE id = ?2",
             params![stored, entry.id],
         )
         .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         entry.html_content = Some(html);
         Ok(Some(entry))
     }
@@ -1251,18 +1320,20 @@ impl SqliteClipboardRepository {
         version: &crate::domain::models::EntryVersion,
         text: &str,
     ) -> Result<bool, String> {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         if !self
-            .get_entry_by_id_with_conn(conn, version.id)?
+            .get_entry_by_id_with_conn(&tx, version.id)?
             .is_some_and(|entry| version.matches(&entry))
         {
             return Ok(false);
         }
-        conn.execute(
+        let changed = tx.execute(
             "UPDATE clipboard_history SET ocr_text = ?1 WHERE id = ?2",
             params![text, version.id],
         )
-        .map(|count| count == 1)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed == 1)
     }
 
     pub(crate) fn get_ocr_text_with_conn(
@@ -1578,16 +1649,32 @@ impl SqliteClipboardRepository {
         &self, id: i64, created_at: i64, content: &str, preview: &str,
     ) -> Result<bool, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        Ok(Self::mutate_if_current(&conn, EntryIdentity { id, created_at }, |tx| {
+            self.update_entry_content_with_conn(tx, id, content, preview)
+        })?.is_some())
+    }
+
+    pub(crate) fn mutate_if_current<T>(
+        conn: &Connection,
+        entry: EntryIdentity,
+        mutate: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-        let current: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM clipboard_history WHERE id = ? AND created_at = ?)",
-            params![id, created_at], |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if current {
-            self.update_entry_content_with_conn(&tx, id, content, preview)?;
+        if !Self::entry_has_created_at(&tx, entry.id, entry.created_at)? {
+            return Ok(None);
         }
+        let result = mutate(&tx)?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(current)
+        Ok(Some(result))
+    }
+
+    fn entry_has_created_at(conn: &Connection, id: i64, created_at: i64) -> Result<bool, String> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM clipboard_history WHERE id = ? AND created_at = ?)",
+            params![id, created_at],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())
     }
 
     pub fn set_ocr_text_if_current(&self, id: i64, created_at: i64, text: &str) -> Result<bool, String> {
@@ -1616,14 +1703,24 @@ impl SqliteClipboardRepository {
         }
     }
 
+    pub(crate) fn get_entry_content_at(&self, id: i64, created_at: Option<i64>) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let stored = conn.query_row(
+            "SELECT content FROM clipboard_history WHERE id = ?1 AND (?2 IS NULL OR created_at = ?2)",
+            params![id, created_at],
+            |row| row.get::<_, String>(0),
+        ).optional().map_err(|e| e.to_string())?;
+        stored.map(|content| self.maybe_decrypt_text(&content)).transpose()
+    }
+
     pub fn get_entry_content_with_html_with_conn(
         &self,
         conn: &Connection,
         id: i64,
-    ) -> Result<Option<(String, String, Option<String>)>, String> {
+    ) -> Result<Option<(String, String, Option<String>, i64)>, String> {
         let mut stmt = conn
             .prepare(
-                "SELECT content, content_type, html_content FROM clipboard_history WHERE id = ?",
+                "SELECT content, content_type, html_content, created_at FROM clipboard_history WHERE id = ?",
             )
             .map_err(|e| e.to_string())?;
         let mut rows = stmt.query(params![id]).map_err(|e| e.to_string())?;
@@ -1636,6 +1733,7 @@ impl SqliteClipboardRepository {
                 self.maybe_decrypt_text(&content)?,
                 content_type,
                 html_content,
+                row.get(3).map_err(|e| e.to_string())?,
             )))
         } else {
             Ok(None)
@@ -1804,17 +1902,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
     }
 
     fn get_entry_content(&self, id: i64) -> Result<Option<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare("SELECT content FROM clipboard_history WHERE id = ?")
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query(params![id]).map_err(|e| e.to_string())?;
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let content: String = row.get(0).map_err(|e| e.to_string())?;
-            Ok(Some(self.maybe_decrypt_text(&content)?))
-        } else {
-            Ok(None)
-        }
+        self.get_entry_content_at(id, None)
     }
 
     fn get_entry_content_full(&self, id: i64) -> Result<Option<(String, String)>, String> {
@@ -1830,7 +1918,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
     fn get_entry_content_with_html(
         &self,
         id: i64,
-    ) -> Result<Option<(String, String, Option<String>)>, String> {
+    ) -> Result<Option<(String, String, Option<String>, i64)>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         self.get_entry_content_with_html_with_conn(&conn, id)
     }
@@ -2396,6 +2484,162 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_replacement_cannot_cross_the_history_write_transaction() {
+        let root = std::env::temp_dir().join(format!("cp-history-write-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("clipboard.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO clipboard_history (content_type, content, source_app, timestamp, created_at, preview)
+             VALUES ('text', 'original', 'Notes', 10, 10, 'original');",
+        ).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        let original = EntryIdentity { id: 1, created_at: 10 };
+        let result = SqliteClipboardRepository::mutate_if_current(&conn, original, |tx| {
+            writer.execute_batch(
+                "BEGIN;
+                 DELETE FROM clipboard_history WHERE id = 1;
+                 INSERT INTO clipboard_history (content_type, content, source_app, timestamp, created_at, preview)
+                 VALUES ('text', 'replacement', 'Notes', 20, 20, 'replacement');
+                 COMMIT;",
+            ).unwrap();
+            assert_eq!(writer.last_insert_rowid(), original.id);
+            tx.execute("DELETE FROM clipboard_history WHERE id = 1", [])
+                .map_err(|error| error.to_string())
+        });
+        assert!(result.is_err());
+        let content: String = conn
+            .query_row("SELECT content FROM clipboard_history WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content, "replacement");
+        drop(writer);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delayed_capture_update_keeps_a_replacement_unchanged() {
+        let repo = search_repository(
+            "INSERT INTO clipboard_history (id, content_type, content, source_app, timestamp, created_at, preview)
+             VALUES (1, 'text', 'new copy', 'Notes', 20, 20, 'new copy');",
+        );
+        let mut captured = repo.get_entry_by_id(1).unwrap().unwrap();
+        captured.created_at = 10;
+        captured.content = "stale capture".into();
+        let conn = repo.conn.lock().unwrap();
+        assert!(repo.save_with_conn(&conn, &captured, None, None).is_err());
+        assert_eq!(repo.get_entry_by_id_with_conn(&conn, 1).unwrap().unwrap().content, "new copy");
+    }
+
+    #[test]
+    fn delayed_paste_actions_leave_a_replacement_unchanged() {
+        let repo = search_repository(
+            "INSERT INTO clipboard_history (id, content_type, content, source_app, timestamp, created_at, sort_at, preview)
+             VALUES (1, 'text', 'new copy', 'Notes', 20, 20, 20, 'new copy');",
+        );
+        let original = EntryIdentity { id: 1, created_at: 10 };
+        assert_eq!(repo.apply_paste_history(original, false, true, None).unwrap(), None);
+        repo.record_use_if_current(original).unwrap();
+        let replacement = repo.get_entry_by_id(1).unwrap().unwrap();
+        assert_eq!((replacement.use_count, replacement.last_used_at, replacement.sort_at), (0, 0, 20));
+        assert_eq!(repo.apply_paste_history(original, true, false, None).unwrap(), None);
+        assert_eq!(repo.get_entry_content(1).unwrap().as_deref(), Some("new copy"));
+        let current = EntryIdentity::from_entry(&replacement);
+        assert_eq!(repo.apply_paste_history(current, false, true, None).unwrap(), Some(PasteHistoryChange::MovedToTop));
+        let updated = repo.get_entry_by_id(1).unwrap().unwrap();
+        assert_eq!(updated.use_count, 1);
+        assert!(updated.sort_at > 20);
+    }
+
+    #[test]
+    fn delayed_editor_save_keeps_a_replacement_unchanged() {
+        let repo = search_repository(
+            "INSERT INTO clipboard_history (id, content_type, content, source_app, timestamp, created_at, preview)
+             VALUES (1, 'text', 'new copy', 'Notes', 20, 20, 'new copy');",
+        );
+        assert!(!repo.update_entry_content_if_current(1, 10, "old editor text", "old editor text").unwrap());
+        assert_eq!(repo.get_entry_content(1).unwrap().as_deref(), Some("new copy"));
+        assert_eq!(repo.get_entry_content_at(1, Some(10)).unwrap(), None);
+        assert!(repo.update_entry_content_if_current(1, 20, "edited text", "edited text").unwrap());
+        assert_eq!(repo.get_entry_content_at(1, Some(20)).unwrap().as_deref(), Some("edited text"));
+    }
+
+    #[test]
+    fn delayed_delete_and_pin_skip_a_replacement() {
+        let repo = search_repository(
+            "INSERT INTO clipboard_history (id, content_type, content, source_app, timestamp, created_at, preview)
+             VALUES (1, 'text', 'new copy', 'Notes', 20, 20, 'new copy');",
+        );
+        let original = EntryIdentity { id: 1, created_at: 10 };
+        assert!(!repo.set_pin_if_current(original, true).unwrap());
+        assert!(!repo.get_entry_by_id(1).unwrap().unwrap().is_pinned);
+        assert!(!repo.delete_if_current(original, None).unwrap());
+        assert_eq!(repo.get_entry_content(1).unwrap().as_deref(), Some("new copy"));
+        let current = EntryIdentity { id: 1, created_at: 20 };
+        assert!(repo.set_pin_if_current(current, true).unwrap());
+        assert_eq!(repo.apply_paste_history(current, true, false, None).unwrap(), Some(PasteHistoryChange::Used));
+        assert!(repo.get_entry_by_id(1).unwrap().unwrap().is_pinned);
+        assert!(repo.delete_if_current(current, None).unwrap());
+    }
+
+    #[test]
+    fn delayed_decryption_skips_a_replacement() {
+        use crate::services::encryption_queue::{EncryptionAction, EncryptionJob};
+        let repo = search_repository(
+            "INSERT INTO clipboard_history (id, content_type, content, source_app, timestamp, created_at, preview)
+             VALUES (1, 'text', 'plain:new copy', 'Notes', 20, 20, 'new copy');",
+        );
+        let conn = repo.conn.lock().unwrap();
+        let read_stored = || conn.query_row("SELECT content FROM clipboard_history WHERE id = 1", [], |row| row.get::<_, String>(0)).unwrap();
+        let job = EncryptionJob {
+            entry: EntryIdentity { id: 1, created_at: 10 },
+            action: EncryptionAction::Decrypt,
+        };
+        job.apply(&conn, &repo).unwrap();
+        assert_eq!(read_stored(), "plain:new copy");
+        EncryptionJob { entry: EntryIdentity { id: 1, created_at: 20 }, ..job }
+            .apply(&conn, &repo).unwrap();
+        assert_eq!(read_stored(), "new copy");
+    }
+
+    #[test]
+    fn sequential_paste_keeps_a_replacement_row_with_the_same_id() {
+        let repo = search_repository(
+            "INSERT INTO clipboard_history
+                (content_type, content, source_app, timestamp, created_at, preview)
+             VALUES ('text', 'before paste', 'Notes', 10, 10, 'before paste');",
+        );
+        let pasted = repo.get_entry_by_id(1).unwrap().unwrap();
+        {
+            let conn = repo.conn.lock().unwrap();
+            repo.delete_with_conn(&conn, pasted.id, None).unwrap();
+            conn.execute(
+                "INSERT INTO clipboard_history
+                    (content_type, content, source_app, timestamp, created_at, preview)
+                 VALUES ('text', 'new copy', 'Notes', 20, 20, 'new copy')",
+                [],
+            )
+            .unwrap();
+            assert_eq!(conn.last_insert_rowid(), pasted.id);
+        }
+
+        assert_eq!(repo.apply_paste_history(EntryIdentity::from_entry(&pasted), true, false, None).unwrap(), None);
+        let replacement = repo
+            .get_entry_by_id(pasted.id)
+            .unwrap()
+            .expect("replacement survives");
+        assert_eq!(replacement.content, "new copy");
+        assert_eq!(replacement.created_at, 20);
+
+        let current = EntryIdentity::from_entry(&replacement);
+        assert_eq!(repo.apply_paste_history(current, true, false, None).unwrap(), Some(PasteHistoryChange::Deleted));
+        assert!(repo.get_entry_by_id(replacement.id).unwrap().is_none());
+        assert_eq!(repo.apply_paste_history(current, true, false, None).unwrap(), None);
+    }
+
+    #[test]
     fn pasted_attachment_cleanup_survives_reopening_the_database() {
         let root = std::env::temp_dir().join(format!("copypaste-delayed-{}", uuid::Uuid::new_v4()));
         let image = root.join("attachments/img_1.png");
@@ -2410,7 +2654,8 @@ mod tests {
             [image.to_str().unwrap()],
         ).unwrap();
         let repo = SqliteClipboardRepository::new(Arc::new(Mutex::new(conn)));
-        repo.delete_after_paste(1, Some(&root)).unwrap();
+        let pasted = repo.get_entry_by_id(1).unwrap().unwrap();
+        assert_eq!(repo.apply_paste_history(EntryIdentity::from_entry(&pasted), true, false, Some(&root)).unwrap(), Some(PasteHistoryChange::Deleted));
         {
             let conn = repo.conn.lock().unwrap();
             repo.sweep_attachment_deletions(&conn, &root, Vec::new(), std::iter::empty()).unwrap();

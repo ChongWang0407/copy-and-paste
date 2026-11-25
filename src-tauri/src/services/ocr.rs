@@ -20,7 +20,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::app_state::{AppDataDir, SessionHistory};
 use crate::database::DbState;
-use crate::domain::models::{ClipboardEntry, EntryVersion};
+use crate::domain::models::{ClipboardEntry, EntryIdentity, EntryVersion};
 use crate::error::{AppError, AppResult};
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
 use crate::services::content_handler::FileVersion;
@@ -174,7 +174,8 @@ pub async fn text_for_entry(
     state: &DbState,
     session: &SessionHistory,
     id: i64,
-) -> AppResult<String> {
+    created_at: Option<i64>,
+) -> AppResult<(String, EntryIdentity)> {
     let (stored, version) = if id > 0 {
         let conn = state.conn.lock().unwrap();
         let entry = state.repo.get_entry_by_id_with_conn(&conn, id)?;
@@ -188,10 +189,13 @@ pub async fn text_for_entry(
             item.map(EntryVersion::from_entry),
         )
     };
+    let version = version
+        .filter(|version| created_at.is_none_or(|expected| version.identity().created_at == expected))
+        .ok_or_else(|| AppError::Validation("content_unavailable".into()))?;
+    let identity = version.identity();
     if let Some(text) = stored {
-        return Ok(text);
+        return Ok((text, identity));
     }
-    let version = version.ok_or_else(|| AppError::Validation("Item not found".to_string()))?;
     let data_dir = app.state::<AppDataDir>().0.lock().unwrap().clone();
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -199,7 +203,7 @@ pub async fn text_for_entry(
             .ok_or_else(|| AppError::Validation("file_missing".to_string()))?;
         let text = recognize_text(&bytes).map_err(AppError::Internal)?;
         if store_result(&handle, &version, file, &text)? {
-            Ok(text)
+            Ok((text, identity))
         } else {
             Err(AppError::Validation(
                 "Image changed during text recognition".into(),

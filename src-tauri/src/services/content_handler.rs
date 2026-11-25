@@ -1,6 +1,7 @@
 // Content handler module for opening various content types.
+use crate::app_state::SessionHistory;
 use crate::database::DbState;
-use crate::domain::models::{ClipboardEntry, EntryVersion};
+use crate::domain::models::{ClipboardEntry, EntryIdentity, EntryVersion};
 use crate::error::AppError;
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
 use crate::infrastructure::repository::settings_repo::SettingsRepository;
@@ -51,40 +52,59 @@ static WATCHED_PREVIEW_ENTRIES: LazyLock<Mutex<HashMap<i64, WatchedEntryInfo>>> 
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PREVIEW_WATCH_READY: Condvar = Condvar::new();
 
+fn entry_not_found() -> AppError {
+    AppError::Validation("Entry not found".into())
+}
+
+fn read_content_entry<T>(entry: Result<Option<T>, String>) -> Result<T, AppError> {
+    entry?.ok_or_else(entry_not_found)
+}
+
+fn session_entry<T>(
+    session: &SessionHistory,
+    id: i64,
+    read: impl FnOnce(&ClipboardEntry) -> T,
+) -> Result<T, AppError> {
+    session
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|item| item.id == id)
+        .map(read)
+        .ok_or_else(entry_not_found)
+}
+
 #[tauri::command]
 pub async fn open_content(
     app_handle: tauri::AppHandle,
     state: State<'_, DbState>,
     id: i64,
-    mut content: String,
+    created_at: Option<i64>,
+    content: String,
     content_type: String,
 ) -> Result<(), AppError> {
-    let mut html_content = None;
-    let mut original_entry = None;
-    // 0. Resolve full content if ID is provided and content is placeholder/truncated
-    if id != 0 {
-        if id > 0 {
-            // Fetch from Database
-            if let Ok(Some(entry)) = state.repo.get_entry_by_id(id) {
-                content = entry.content.clone();
-                html_content = entry.html_content.clone();
-                original_entry = Some(entry);
-            }
-        } else {
-            // Fetch from Session
-            let session = app_handle.state::<crate::app_state::SessionHistory>();
-            let session_items = session.0.lock().unwrap();
-            if let Some(item) = session_items.iter().find(|i| i.id == id) {
-                content = item.content.clone();
-                html_content = item.html_content.clone();
-                original_entry = Some(item.clone());
-            }
+    let original_entry = if id > 0 {
+        Some(read_content_entry(state.repo.get_entry_by_id(id))?)
+    } else if id < 0 {
+        let session = app_handle.state::<SessionHistory>();
+        Some(session_entry(&session, id, ClipboardEntry::clone)?)
+    } else {
+        None
+    };
+    if let (Some(entry), Some(expected)) = (&original_entry, created_at) {
+        if entry.created_at != expected {
+            return Err(entry_not_found());
         }
     }
+    let (content, html_content) = match &original_entry {
+        Some(entry) => (entry.content.as_str(), &entry.html_content),
+        None => (content.as_str(), &None),
+    };
 
     // Increment use count if ID is provided
-    if id > 0 {
-        let _ = state.repo.increment_use_count(id);
+    if let Some(entry) = original_entry.as_ref().filter(|entry| entry.id > 0) {
+        state.repo.record_use_if_current(EntryIdentity::from_entry(entry))?;
     }
 
     let app_path = get_app_path_for_content_type(&state, &content_type)?;
@@ -102,13 +122,13 @@ pub async fn open_content(
 
     // Handle links/URLs
     if content_type == "link" || content_type == "url" {
-        return handle_url_content(&app_path, &content).await;
+        return handle_url_content(&app_path, content).await;
     }
 
     // Several copied files open together, as a Finder or Explorer selection does.
     // Only the first one used to open.
     if content_type == "file" {
-        let paths = existing_file_paths(&content);
+        let paths = existing_file_paths(content);
         if paths.len() > 1 {
             launch_files_with_app(&app_path, &paths).await?;
             return Ok(());
@@ -118,10 +138,10 @@ pub async fn open_content(
     // Check if content points to existing file(s)
     let mut entry_file = None;
     if is_file_type(&content_type) && !content.starts_with("data:image") {
-        if let Some(path) = entry_file_path(&app_handle, &content) {
+        if let Some(path) = entry_file_path(&app_handle, content) {
             let data_dir = app_data_dir(&app_handle);
             entry_file = Some(file_to_open(&content_type, path, data_dir.as_deref())?);
-        } else if names_missing_file(&content_type, &content) {
+        } else if names_missing_file(&content_type, content) {
             return Err(AppError::Validation(FILE_MISSING.into()));
         }
     }
@@ -131,8 +151,8 @@ pub async fn open_content(
         Some(file) => (file.path, file.is_original),
         None => (
             create_temp_file(
-                &content,
-                &html_content,
+                content,
+                html_content,
                 &content_type,
                 &filename,
                 std::env::temp_dir(),
@@ -177,23 +197,21 @@ pub async fn share_content(
     app_handle: tauri::AppHandle,
     state: State<'_, DbState>,
     id: i64,
-    mut content: String,
+    content: String,
     content_type: String,
     anchor: crate::infrastructure::macos_api::share::AnchorRect,
 ) -> Result<(), AppError> {
     use crate::infrastructure::macos_api::share::{show_share_picker, ShareItem};
 
-    if id > 0 {
-        if let Ok(Some((full_content, _, _))) = state.repo.get_entry_content_with_html(id) {
-            content = full_content;
-        }
+    let content = if id > 0 {
+        let (full_content, _, _, _) = read_content_entry(state.repo.get_entry_content_with_html(id))?;
+        full_content
     } else if id < 0 {
-        let session = app_handle.state::<crate::app_state::SessionHistory>();
-        let session_items = session.0.lock().unwrap();
-        if let Some(item) = session_items.iter().find(|i| i.id == id) {
-            content = item.content.clone();
-        }
-    }
+        let session = app_handle.state::<SessionHistory>();
+        session_entry(&session, id, |entry| entry.content.clone())?
+    } else {
+        content
+    };
 
     let item = match content_type.as_str() {
         "file" | "video" => {
@@ -585,17 +603,19 @@ fn touch_external_file_preview(
     if id > 0 {
         let state = watch.app.state::<DbState>();
         let conn = state.conn.lock().unwrap();
-        let Some(entry) = state.repo.get_entry_by_id_with_conn(&conn, id)? else {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let Some(entry) = state.repo.get_entry_by_id_with_conn(&tx, id)? else {
             return Ok(None);
         };
         if !watch.version.matches(&entry) {
             return Ok(None);
         }
-        state.repo.refresh_file_preview(&conn, id, now, hash)?;
+        state.repo.refresh_file_preview(&tx, id, now, hash)?;
         let mut entry = state
             .repo
-            .get_entry_by_id_with_conn(&conn, id)?
+            .get_entry_by_id_with_conn(&tx, id)?
             .expect("entry still exists");
+        tx.commit().map_err(|e| e.to_string())?;
         entry.file_preview_exists = exists;
         Ok(Some(entry))
     } else {
@@ -706,7 +726,8 @@ fn update_database_with_changes(
     if id > 0 {
         let state = watch.app.state::<DbState>();
         let conn = state.conn.lock().unwrap();
-        let Some(entry) = state.repo.get_entry_by_id_with_conn(&conn, id)? else {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let Some(entry) = state.repo.get_entry_by_id_with_conn(&tx, id)? else {
             return Ok(None);
         };
         if !watch.version.matches(&entry) {
@@ -714,8 +735,10 @@ fn update_database_with_changes(
         }
         state
             .repo
-            .update_entry_content_with_conn(&conn, id, &new_content, preview)?;
-        state.repo.get_entry_by_id_with_conn(&conn, id)
+            .update_entry_content_with_conn(&tx, id, &new_content, preview)?;
+        let entry = state.repo.get_entry_by_id_with_conn(&tx, id)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(entry)
     } else {
         let session = watch.app.state::<crate::app_state::SessionHistory>();
         let mut history = session.0.lock().unwrap();
@@ -817,7 +840,53 @@ fn store_edited_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{existing_file_paths, file_to_open, names_missing_file};
+    use super::{existing_file_paths, file_to_open, names_missing_file, read_content_entry, session_entry};
+    use crate::app_state::SessionHistory;
+    use crate::error::AppError;
+    use crate::infrastructure::repository::clipboard_repo::{ClipboardRepository, SqliteClipboardRepository};
+    use crate::infrastructure::repository::migrations::run_migrations;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn opening_and_sharing_fail_for_missing_or_unreadable_full_content() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO clipboard_history
+                (id, content_type, content, source_app, timestamp, preview, html_content)
+             VALUES (1, 'rich_text', 'full body', 'Notes', 1, 'preview', 'dpapi:unreadable'),
+                    (2, 'rich_text', 'full body', 'Notes', 2, 'preview', '<b>full body</b>');",
+        )
+        .unwrap();
+        let repo = SqliteClipboardRepository::new(Arc::new(Mutex::new(conn)));
+
+        assert!(matches!(
+            read_content_entry(repo.get_entry_by_id(1)),
+            Err(AppError::Internal(_))
+        ));
+        assert!(matches!(
+            read_content_entry(repo.get_entry_content_with_html(1)),
+            Err(AppError::Internal(_))
+        ));
+        assert!(matches!(
+            read_content_entry(repo.get_entry_by_id(404)),
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            read_content_entry(repo.get_entry_content_with_html(404)),
+            Err(AppError::Validation(_))
+        ));
+        let mut entry = read_content_entry(repo.get_entry_by_id(2)).unwrap();
+        assert_eq!(entry.content, "full body");
+        assert_eq!(
+            read_content_entry(repo.get_entry_content_with_html(2)).unwrap().2.as_deref(),
+            Some("<b>full body</b>")
+        );
+        entry.id = -1;
+        let session = SessionHistory(Mutex::new([entry].into()));
+        assert_eq!(session_entry(&session, -1, |item| item.content.clone()).unwrap(), "full body");
+        assert!(matches!(session_entry(&session, -2, |_| ()), Err(AppError::Validation(_))));
+    }
 
     #[test]
     fn existing_file_paths_keeps_every_file_still_on_disk() {
