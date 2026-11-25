@@ -4,11 +4,13 @@ import { ArrowDown } from "lucide-react";
 import type { ClipboardEntry, Translate } from "../../shared/types";
 import { startWindowDrag } from "../../shared/lib/windowDrag";
 import { withNativeDialog } from "../../shared/lib/focus";
+import { translationErrorMessage, type TranslationConfig } from "./config";
 import { detectDirection, type TranslateDirection, type TranslateLanguage } from "./direction";
 
 interface TranslatePanelProps {
   t: Translate;
   entry: ClipboardEntry;
+  config: TranslationConfig;
   deleteAfterPaste: boolean;
   moveToTopAfterPaste: boolean;
   pushToast: (message: string, duration?: number) => void;
@@ -19,18 +21,11 @@ interface TranslatePanelProps {
 const languageName = (t: Translate, language: TranslateLanguage) =>
   t(language === "en" ? "translate_lang_en" : "translate_lang_zh");
 
-const errorMessage = (t: Translate, error: unknown) => {
-  const text = String(error);
-  if (text.includes("unsupported_os")) return t("translate_unsupported_os");
-  if (text.includes("cancelled")) return t("translate_cancelled");
-  if (text.includes("unsupported_pair")) return t("translate_unavailable");
-  return t("translate_failed") + text;
-};
-
 /** 翻译: 原文 above, 译文 below, both editable. Chinese ↔ English only. */
 const TranslatePanel = ({
   t,
   entry,
+  config,
   deleteAfterPaste,
   moveToTopAfterPaste,
   pushToast,
@@ -44,6 +39,10 @@ const TranslatePanel = ({
   const [error, setError] = useState<string | null>(null);
   // Only the latest request may fill in 译文.
   const requestRef = useRef(0);
+  const { provider, openaiModel } = config;
+  const providerBadge = provider === "apple" ? t("translate_badge_apple")
+    : provider === "openai" && openaiModel ? `OpenAI · ${openaiModel}`
+    : t(`translate_provider_${provider}`);
 
   const run = useCallback(
     async (text: string) => {
@@ -55,22 +54,23 @@ const TranslatePanel = ({
       setError(null);
       const translate = () => invoke<string>("translate_text", { text, ...next });
       try {
-        const status = await invoke<string>("translation_status", { ...next }).catch(() => "installed");
-        // A missing language pack brings up the system's download prompt:
-        // the window must not hide while it is open.
-        const translated = status === "download" ? await withNativeDialog(translate, "translate") : await translate();
+        const needsDownload = provider === "apple"
+          && await invoke<string>("translation_status", { ...next }) === "download";
+        const translated = needsDownload ? await withNativeDialog(translate, "translate") : await translate();
         if (request === requestRef.current) setResult(translated);
       } catch (failure) {
         if (request === requestRef.current) {
           setResult("");
-          setError(errorMessage(t, failure));
+          setError(translationErrorMessage(t, failure));
         }
       } finally {
         if (request === requestRef.current) setBusy(false);
       }
     },
-    [t]
+    [provider, t]
   );
+  const runOnOpen = useRef(run);
+  runOnOpen.current = run;
 
   useEffect(() => {
     let alive = true;
@@ -80,13 +80,13 @@ const TranslatePanel = ({
       .then((full) => {
         if (!alive) return;
         setSource(full);
-        void run(full);
+        void runOnOpen.current(full);
       });
     return () => {
       alive = false;
       requestRef.current += 1;
     };
-  }, [entry.content, entry.id, run]);
+  }, [entry.content, entry.id]);
 
   const pasteText = (text: string) =>
     invoke("paste_text", {
@@ -105,6 +105,7 @@ const TranslatePanel = ({
     <div className="side-panel-body">
       <div className="panel-title" onMouseDown={startWindowDrag}>
         <h2>{t("translate_title")}</h2>
+        <span className="translate-provider-badge" title={providerBadge}>{providerBadge}</span>
       </div>
       <div className="translate-body">
         <label className="translate-label">

@@ -82,8 +82,12 @@ pub fn init(data_dir: &Path) {
 }
 
 fn get_master_key() -> Option<&'static [u8; KEY_LEN]> {
+    master_key(false)
+}
+
+fn master_key(create_in_portable: bool) -> Option<&'static [u8; KEY_LEN]> {
     MASTER_KEY
-        .get_or_init(|| match load_or_create_master_key() {
+        .get_or_init(|| match load_or_create_master_key(create_in_portable) {
             Ok(key) => Some(key),
             Err(e) => {
                 eprintln!(">>> [ENCRYPTION] master key unavailable this session: {e}");
@@ -105,7 +109,7 @@ fn data_dir() -> Option<&'static PathBuf> {
     DATA_DIR.get()
 }
 
-fn load_or_create_master_key() -> Result<[u8; KEY_LEN], String> {
+fn load_or_create_master_key(create_in_portable: bool) -> Result<[u8; KEY_LEN], String> {
     // Debug macOS: never touch Keychain. Dev binaries re-sign every rebuild, so
     // Keychain prompts loop / deadlock the main thread during Tauri setup.
     #[cfg(all(target_os = "macos", debug_assertions))]
@@ -113,7 +117,7 @@ fn load_or_create_master_key() -> Result<[u8; KEY_LEN], String> {
         eprintln!(
             ">>> [ENCRYPTION] debug build: using local master.key (Keychain disabled)"
         );
-        return load_or_create_file_key(FALLBACK_KEY_FILE);
+        return load_or_create_file_key(FALLBACK_KEY_FILE, create_in_portable);
     }
 
     #[cfg(all(target_os = "macos", not(debug_assertions)))]
@@ -124,7 +128,7 @@ fn load_or_create_master_key() -> Result<[u8; KEY_LEN], String> {
             // Access-denied / user-cancel must NOT overwrite the existing key,
             // otherwise previously encrypted data becomes undecryptable.
             Err(KeychainLoadError::NotFound) => {
-                if cfg!(feature = "portable") {
+                if cfg!(feature = "portable") && !create_in_portable {
                     return Err("existing master key not found".into());
                 }
                 // The key stays in the Keychain of the Mac that made it, so
@@ -148,7 +152,7 @@ fn load_or_create_master_key() -> Result<[u8; KEY_LEN], String> {
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        load_or_create_file_key(FALLBACK_KEY_FILE)
+        load_or_create_file_key(FALLBACK_KEY_FILE, create_in_portable)
     }
 }
 
@@ -175,7 +179,7 @@ fn ensure_no_orphaned_ciphertext() -> Result<(), String> {
     not(any(target_os = "macos", target_os = "windows")),
     all(target_os = "macos", debug_assertions)
 ))]
-fn load_or_create_file_key(filename: &str) -> Result<[u8; KEY_LEN], String> {
+fn load_or_create_file_key(filename: &str, create_in_portable: bool) -> Result<[u8; KEY_LEN], String> {
     let dir = data_dir().ok_or_else(|| "encryption data dir not set".to_string())?;
     let path = dir.join(filename);
     if path.exists() {
@@ -187,7 +191,7 @@ fn load_or_create_file_key(filename: &str) -> Result<[u8; KEY_LEN], String> {
         key.copy_from_slice(&bytes);
         return Ok(key);
     }
-    if cfg!(feature = "portable") {
+    if cfg!(feature = "portable") && !create_in_portable {
         return Err("existing master key not found".into());
     }
     ensure_no_orphaned_ciphertext()?;
@@ -284,16 +288,26 @@ pub fn encrypt_value(plain: &str) -> Option<String> {
     }
     #[cfg(not(feature = "portable"))]
     {
-        let key = get_master_key()?;
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        fill_random(&mut nonce_bytes)?;
-        let ciphertext = aes_gcm_seal(key, &nonce_bytes, &[], plain.as_bytes())?;
-        let mut packed = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-        packed.extend_from_slice(&nonce_bytes);
-        packed.extend_from_slice(&ciphertext);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(packed);
-        Some(format!("{ENCRYPT_PREFIX}{encoded}"))
+        seal_value(get_master_key()?, plain)
     }
+}
+
+fn seal_value(key: &[u8; KEY_LEN], plain: &str) -> Option<String> {
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    fill_random(&mut nonce_bytes)?;
+    let ciphertext = aes_gcm_seal(key, &nonce_bytes, &[], plain.as_bytes())?;
+    let mut packed = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    packed.extend_from_slice(&nonce_bytes);
+    packed.extend_from_slice(&ciphertext);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(packed);
+    Some(format!("{ENCRYPT_PREFIX}{encoded}"))
+}
+
+/// Translation credentials require encryption even in portable builds.
+pub fn encrypt_translation_key(value: &str) -> Result<String, String> {
+    master_key(true)
+        .and_then(|key| seal_value(key, value))
+        .ok_or_else(|| "encryption unavailable; value was not saved".into())
 }
 
 pub fn decrypt_value(cipher: &str) -> Option<String> {

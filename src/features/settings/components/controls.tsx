@@ -93,10 +93,12 @@ export const Segmented = <T extends string>({
   value,
   options,
   onChange,
+  disabled = false,
 }: {
   value: T;
   options: { value: T; label: string }[];
   onChange: (value: T) => void;
+  disabled?: boolean;
 }) => (
   <div className="segmented" role="radiogroup">
     {options.map((option) => (
@@ -105,6 +107,7 @@ export const Segmented = <T extends string>({
         type="button"
         role="radio"
         aria-checked={value === option.value}
+        disabled={disabled}
         className={`segment${value === option.value ? " is-active" : ""}`}
         onClick={() => onChange(option.value)}
       >
