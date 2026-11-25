@@ -322,6 +322,12 @@ pub fn resolve_entry_file_path(
     if path.exists() {
         return Some(path.to_path_buf());
     }
+    // Only an attachment of an older data folder moves with it. A missing
+    // file of the user's own must not resolve to an unrelated attachment
+    // that happens to share its name.
+    if path.parent().and_then(|parent| parent.file_name()) != Some(std::ffi::OsStr::new("attachments")) {
+        return None;
+    }
     let candidate = data_dir.join("attachments").join(path.file_name()?);
     candidate.is_file().then_some(candidate)
 }
@@ -626,6 +632,10 @@ mod tests {
         let gone = root.join("com.old.copypaste").join("attachments").join("img_2.png");
         assert_eq!(resolve_entry_file_path(&gone.to_string_lossy(), &data_dir), None);
         assert_eq!(resolve_entry_file_path("  ", &data_dir), None);
+        // A deleted file of the user's own never resolves to an attachment
+        // that only shares its name.
+        let own = root.join("Downloads").join("img_1.png");
+        assert_eq!(resolve_entry_file_path(&own.to_string_lossy(), &data_dir), None);
 
         std::fs::remove_dir_all(&root).unwrap();
     }
