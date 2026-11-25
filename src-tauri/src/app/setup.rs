@@ -93,7 +93,7 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let _ = GLOBAL_APP_HANDLE.set(app_handle.clone());
 
     // 1. Data Directory & Migration
-    let app_dir = resolve_data_dir(app)?;
+    let mut app_dir = resolve_data_dir(app)?;
 
     // 2. Logger Initialization
     crate::logger::init(app_dir.join("copy-paste.log"));
@@ -107,6 +107,19 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         let destination = default_app_data_dir(app.path())?;
         crate::app::data_directory::finish(&legacy, &destination, &app_dir)
             .map_err(std::io::Error::other)?;
+        match crate::app::data_directory::apply_requested_move(&destination, &app_dir) {
+            Ok(Some(path)) => {
+                app_dir = path;
+                crate::infrastructure::encryption::init(&app_dir);
+                crate::logger::init(app_dir.join("copy-paste.log"));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                crate::error!(">>> [STARTUP] {error}");
+                app.dialog().message(error).kind(MessageDialogKind::Error).show(|_| {});
+            }
+        }
     }
 
     // 3. Database Initialization
@@ -133,10 +146,13 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     // 4. Avoid stale persisted pin state causing unexpected always-on-top behavior.
     let _ = settings_repo.set("app.window_pinned", "false");
 
-    let settings = load_settings(&settings_repo);
+    let settings = load_settings(&settings_repo)?;
 
     // 5. App State Management
+    crate::app::commands::thumbnail_cmd::init_thumbnail_cache(app.handle());
+    crate::app::data_directory::prepare_session(&app_dir)?;
     setup_state(app, conn_arc.clone(), &settings, app_dir.clone());
+    crate::services::clipboard::start_session_file_sweeper(app.handle().clone());
     app.manage(EncryptionQueueState(init_encryption_queue(app_handle.clone())));
     spawn_sensitive_alignment(app_handle.clone());
 
@@ -257,27 +273,24 @@ pub struct StartupSettings {
     pub capsule_duration_ms: u64,
 }
 
-pub(crate) fn load_settings(repo: &impl SettingsRepository) -> StartupSettings {
+pub(crate) fn load_settings(repo: &SqliteSettingsRepository) -> rusqlite::Result<StartupSettings> {
+    let values = repo.app_settings()?;
     let get = |key: &str, default: &str| -> String {
-        repo.get(key)
-            .ok()
-            .flatten()
+        values.get(key).cloned()
             .unwrap_or_else(|| default.to_string())
     };
     let flag = |key: &str, default: bool| -> bool {
-        match repo.get(key).ok().flatten() {
+        match values.get(key) {
             Some(v) => v == "true",
             None => default,
         }
     };
     let size = |key: &str| -> Option<f64> {
-        repo.get(key)
-            .ok()
-            .flatten()
+        values.get(key)
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
     };
-    StartupSettings {
+    Ok(StartupSettings {
         persistent: get("app.persistent", "true") != "false",
         deduplicate: flag("app.deduplicate", true),
         silent_start: flag("app.silent_start", false),
@@ -316,7 +329,7 @@ pub(crate) fn load_settings(repo: &impl SettingsRepository) -> StartupSettings {
             crate::app::capsule::DURATION_KEY,
             "",
         )),
-    }
+    })
 }
 
 fn setup_state(
@@ -340,8 +353,6 @@ fn setup_state(
     app.manage(SessionHistory(std::sync::Mutex::new(
         std::collections::VecDeque::new(),
     )));
-    crate::app::commands::thumbnail_cmd::init_thumbnail_cache(app.handle());
-    crate::services::clipboard::start_session_file_sweeper(app.handle().clone(), &app_dir);
     app.manage(AppDataDir(std::sync::Mutex::new(app_dir)));
     app.manage(PasteQueue::default());
 }

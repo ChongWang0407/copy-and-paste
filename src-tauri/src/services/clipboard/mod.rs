@@ -246,7 +246,7 @@ pub use utils::{
     app_likely_word_processor, attach_rich_image_fallback, attach_rich_named_formats,
     build_clipboard_text_fingerprint, build_entry_preview, build_exact_paste_html,
     derive_rich_text_content, detect_content_type, embed_local_images, encode_cf_html,
-    entry_matches_search, entry_searchable_text, extract_animated_image_data_url_from_html,
+    entry_matches_search, extract_animated_image_data_url_from_html,
     extract_animated_image_data_url_from_text, extract_first_image_data_url_from_html,
     html_has_renderable_rich_body, normalize_clipboard_line_endings,
     normalize_plain_text_for_clipboard_paste, parse_cf_html, plain_text_from_tabular_html,

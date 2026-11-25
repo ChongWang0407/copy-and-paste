@@ -1082,26 +1082,6 @@ pub fn build_entry_preview(
     }
 }
 
-/// Plain text used for search — matches what the list shows (`preview`), not file paths or raw HTML.
-pub fn entry_searchable_text(entry: &ClipboardEntry) -> String {
-    if !is_text_type(&entry.content_type) {
-        return String::new();
-    }
-
-    if !entry.preview.trim().is_empty() {
-        return entry.preview.clone();
-    }
-
-    if entry.content_type == "rich_text" {
-        let normalized = derive_rich_text_content(&entry.content, entry.html_content.as_deref());
-        if !normalized.trim().is_empty() {
-            return normalized;
-        }
-    }
-
-    entry.content.clone()
-}
-
 pub fn entry_matches_search(
     entry: &ClipboardEntry,
     term: &str,
@@ -1128,16 +1108,16 @@ pub fn entry_matches_search(
         return note.to_lowercase().contains(&term);
     }
 
+    if term.is_empty() {
+        return false;
+    }
+
     if entry
         .ocr_text
         .as_deref()
         .is_some_and(|text| text.to_lowercase().contains(&term))
     {
         return true;
-    }
-
-    if term.is_empty() {
-        return false;
     }
 
     if entry.tags.iter().any(|t| t.to_lowercase().contains(&term)) {
@@ -1152,7 +1132,11 @@ pub fn entry_matches_search(
         return true;
     }
 
-    entry_searchable_text(entry).to_lowercase().contains(&term)
+    is_text_type(&entry.content_type)
+        && (entry.content.to_lowercase().contains(&term)
+            || entry.preview.to_lowercase().contains(&term)
+            || (entry.content_type == "rich_text" && entry.preview.trim().is_empty()
+                && derive_rich_text_content(&entry.content, entry.html_content.as_deref()).to_lowercase().contains(&term)))
 }
 
 pub fn rtf_bytes_from_named_formats(
@@ -1688,11 +1672,20 @@ mod tests {
     }
 
     #[test]
-    fn entry_matches_search_finds_text_in_preview() {
-        let entry = sample_entry("text", "full body hidden", "hello world");
+    fn entry_matches_search_finds_full_text_and_preview() {
+        let body = format!("{}hidden", "a".repeat(600));
+        let entry = sample_entry("text", &body, "hello world");
 
         assert!(entry_matches_search(&entry, "hello", false, false));
-        assert!(!entry_matches_search(&entry, "hidden", false, false));
+        assert!(entry_matches_search(&entry, "hidden", false, false));
+    }
+
+    #[test]
+    fn empty_search_does_not_match_an_image_with_ocr_text() {
+        let mut entry = sample_entry("image", "/tmp/image.png", "[Image Content]");
+        entry.ocr_text = Some("recognized words".into());
+        assert!(!entry_matches_search(&entry, " ", false, false));
+        assert!(entry_matches_search(&entry, "recognized", false, false));
     }
 
     #[test]

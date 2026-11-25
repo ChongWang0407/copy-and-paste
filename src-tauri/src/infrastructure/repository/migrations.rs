@@ -1,6 +1,11 @@
 use rusqlite::{params, Connection, Result};
 
 pub fn run_migrations(conn: &Connection) -> Result<()> {
+    run_upstream_migrations(conn)?;
+    ensure_fork_schema(conn)
+}
+
+fn run_upstream_migrations(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
@@ -468,6 +473,22 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_fork_schema(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "favorites", "is_encrypted")? {
+        conn.execute_batch("ALTER TABLE favorites ADD COLUMN is_encrypted INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_fork_history_display_order ON clipboard_history
+              (is_pinned DESC, (CASE WHEN is_pinned = 1 THEN pinned_order ELSE 0 END) DESC,
+               sort_at DESC, id DESC);
+         CREATE TABLE IF NOT EXISTS pending_attachment_deletions (
+             path TEXT PRIMARY KEY,
+             delete_after INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS fork_migrations (name TEXT PRIMARY KEY);",
+    )
+}
+
 fn has_column(conn: &Connection, table_name: &str, column_name: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table_name))?;
     let mut rows = stmt.query([])?;
@@ -483,6 +504,67 @@ fn has_column(conn: &Connection, table_name: &str, column_name: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infrastructure::repository::clipboard_repo::{ClipboardRepository, ClipboardSortMode, SqliteClipboardRepository};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn schema_21_rows_survive_two_fork_migrations_and_remain_searchable() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_upstream_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO clipboard_history
+                (id, content_type, content, html_content, source_app, source_app_path, timestamp,
+                 created_at, last_used_at, sort_at, preview, is_pinned, pinned_order, tags,
+                 use_count, content_hash, is_external, note, ocr_text)
+             VALUES
+                (1, 'text', '  ', NULL, 'Notes', '/Applications/Notes.app', 10, 8, 9, 10,
+                 '··', 0, 19, '[\"work\"]', 3, 113, 0, 'kept', NULL),
+                (2, 'rich_text', 'needle', '<b>needle</b>', 'Notes', NULL, 20, 18, 19, 20,
+                 'needle', 1, 4, '[]', 1, 114, 0, '', NULL),
+                (3, 'image', '/example/attachments/img_1.png', NULL, 'Preview', NULL, 30, 29, 0, 30,
+                 'Image', 0, 0, '[]', 0, 115, 1, '', 'needle inside image');
+             INSERT INTO entry_tags (entry_id, tag) VALUES (1, 'work');
+             INSERT INTO favorites
+                (id, content_type, content, html_content, preview, source_app, sort_order, created_at, updated_at)
+             VALUES (7, 'rich_text', 'needle', '<b>needle</b>', 'needle', 'Notes', 2, 40, 41);
+             INSERT INTO settings (key, value) VALUES ('app.persistent', 'false');",
+        ).unwrap();
+
+        fn rows(conn: &Connection, query: &str) -> Vec<Vec<rusqlite::types::Value>> {
+            let mut stmt = conn.prepare(query).unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([], |row| (0..columns).map(|column| row.get(column)).collect())
+                .unwrap().collect::<Result<_>>().unwrap()
+        }
+
+        let queries = [
+            "SELECT * FROM clipboard_history ORDER BY id",
+            "SELECT id, content_type, content, html_content, preview, source_app, sort_order,
+                    created_at, updated_at FROM favorites ORDER BY id",
+            "SELECT * FROM entry_tags ORDER BY entry_id, tag",
+            "SELECT * FROM saved_tags ORDER BY name",
+            "SELECT * FROM settings ORDER BY key",
+            "SELECT * FROM schema_migrations ORDER BY version",
+        ];
+        let before: Vec<_> = queries.iter().map(|query| rows(&conn, query)).collect();
+        for _ in 0..2 {
+            run_migrations(&conn).unwrap();
+            for (query, expected) in queries.iter().zip(&before) {
+                assert_eq!(rows(&conn, query), *expected, "{query}");
+            }
+        }
+        let repo = SqliteClipboardRepository::new(Arc::new(Mutex::new(conn)));
+        let history = repo.get_history_sorted(10, 0, None, ClipboardSortMode::Manual).unwrap();
+        assert_eq!(history.iter().map(|entry| entry.id).collect::<Vec<_>>(), [2, 3, 1]);
+        assert_eq!(history[2].preview, "··");
+        assert!(history[0].html_content.is_none());
+        assert_eq!(repo.get_entry_content_with_html(2).unwrap().unwrap().2.as_deref(), Some("<b>needle</b>"));
+        let image = repo.search_filtered("needle", 1, false, false, Some("image")).unwrap();
+        assert_eq!(image.len(), 1);
+        assert_eq!(image[0].id, 3);
+        assert!(image[0].ocr_match);
+        assert_eq!(repo.search_filtered("needle", 1, false, false, Some("text")).unwrap()[0].id, 2);
+    }
 
     #[test]
     fn migration_14_preserves_existing_order_and_backfills_creation_time() {
@@ -587,7 +669,7 @@ mod tests {
         )
         .expect("create version 15 fixture");
 
-        run_migrations(&conn).expect("run update migrations");
+        run_upstream_migrations(&conn).expect("run update migrations");
 
         let volume = |conn: &Connection| -> f64 {
             conn.query_row(
@@ -605,7 +687,7 @@ mod tests {
         conn.execute("UPDATE settings SET value = '0.5' WHERE key = 'app.sound_volume'", [])
             .unwrap();
         conn.execute("DELETE FROM schema_migrations WHERE version >= 16", []).unwrap();
-        run_migrations(&conn).expect("rerun migration 16");
+        run_upstream_migrations(&conn).expect("rerun migration 16");
         assert!((volume(&conn) - 0.5).abs() < 1e-9);
     }
 
@@ -630,14 +712,14 @@ mod tests {
                 .expect("read paste method")
         };
 
-        run_migrations(&conn).expect("run update migrations");
+        run_upstream_migrations(&conn).expect("run update migrations");
         assert_eq!(method(&conn), "auto");
 
         // Other choices are kept.
         for kept in ["ctrl_v", "game_mode"] {
             conn.execute("UPDATE settings SET value = ?1 WHERE key = 'app.paste_method'", [kept]).unwrap();
             conn.execute("DELETE FROM schema_migrations WHERE version >= 18", []).unwrap();
-            run_migrations(&conn).expect("rerun migration 18");
+            run_upstream_migrations(&conn).expect("rerun migration 18");
             assert_eq!(method(&conn), kept);
         }
     }
@@ -668,7 +750,7 @@ mod tests {
                 }
             }
             conn.execute("DELETE FROM schema_migrations WHERE version >= 19", []).unwrap();
-            run_migrations(conn).expect("run migration 19");
+            run_upstream_migrations(conn).expect("run migration 19");
             assert_eq!(setting(conn, "app.rich_paste_hotkey"), None);
             setting(conn, "app.plain_paste_hotkey")
         };

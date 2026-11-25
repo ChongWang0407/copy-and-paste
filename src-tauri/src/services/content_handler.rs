@@ -799,10 +799,14 @@ fn store_edited_image(
     let bytes = general_purpose::STANDARD
         .decode(encoded)
         .map_err(|err| err.to_string())?;
-    let mut root = app_data_dir(app).ok_or("data directory unavailable")?;
-    if id < 0 {
-        root.push("session");
-    }
+    let data_dir = app_data_dir(app).ok_or("data directory unavailable")?;
+    // Session entries keep files in the marked session folder, which is
+    // swept once no session entry shows them; database entries use attachments/.
+    let root = if id < 0 {
+        crate::app::data_directory::session_storage_root(&data_dir)
+    } else {
+        data_dir
+    };
     let ext = crate::database::attachment_extension(&bytes, "png");
     let hash = crate::database::stable_bytes_hash(&bytes);
     let path = pending

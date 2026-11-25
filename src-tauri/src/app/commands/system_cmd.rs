@@ -1,6 +1,5 @@
 use crate::app_state::AppDataDir;
 use crate::error::{AppError, AppResult};
-use rusqlite::{params, Connection, OptionalExtension};
 use serde_json;
 use tauri::{AppHandle, Manager, State};
 
@@ -211,15 +210,23 @@ pub fn restart_explorer() -> AppResult<()> {
 
 
 
-#[tauri::command]
-pub fn relaunch(app: AppHandle) {
-    use std::process::Command;
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = Command::new(exe).spawn();
-    }
-    crate::app::system::request_app_exit(&app);
+fn launch_after_exit(pid: u32, replacement: &std::path::Path) -> std::process::Command {
+    // Wait for the old database connections and singleton socket to close.
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args(["-c", r#"while kill -0 "$1" 2>/dev/null; do sleep 0.1; done; shift; exec "$@""#, "copypaste-relaunch"])
+        .arg(pid.to_string())
+        .arg(replacement)
+        .stdin(std::process::Stdio::null());
+    command
 }
 
+#[tauri::command]
+pub fn relaunch(app: AppHandle) -> AppResult<()> {
+    launch_after_exit(std::process::id(), &std::env::current_exe()?).spawn()?;
+    crate::app::system::request_app_exit(&app);
+    Ok(())
+}
 
 #[tauri::command]
 pub fn check_is_admin() -> bool {
@@ -228,347 +235,15 @@ pub fn check_is_admin() -> bool {
 
 #[tauri::command]
 pub fn set_data_path(app_handle: AppHandle, new_path: String) -> AppResult<()> {
-    // Moving it would be undone at the next start (see portable_data_dir).
     if crate::app::setup::portable_data_dir().is_some() {
         return Err(AppError::Validation(
             "便携版的数据保存在程序旁的 data 文件夹，不能更换位置。".to_string(),
         ));
     }
-    let clean_path = new_path.trim().to_string();
-    let new_data_path = std::path::Path::new(&clean_path);
-    if !new_data_path.exists() {
-        return Err(AppError::Validation("Directory does not exist".to_string()));
-    }
-    if !new_data_path.is_dir() {
-        return Err(AppError::Validation(
-            "Selected path is not a directory".to_string(),
-        ));
-    }
-    #[cfg(target_os = "macos")]
-    if clean_path.to_ascii_lowercase().ends_with(".app") {
-        return Err(AppError::Validation(
-            "Cannot use a .app bundle as data directory. Please choose a normal folder."
-                .to_string(),
-        ));
-    }
-
-    let old_path_buf = app_handle.state::<AppDataDir>().0.lock().unwrap().clone();
-    if std::fs::canonicalize(&old_path_buf).ok() == std::fs::canonicalize(new_data_path).ok() {
-        return Ok(());
-    }
-    // Keep the original key recoverable and refuse to merge different key stores.
-    for name in ["master.key", "master.key.dpapi"] {
-        let source = old_path_buf.join(name);
-        let destination = new_data_path.join(name);
-        if !source.exists() { continue; }
-        let bytes = std::fs::read(&source).map_err(AppError::from)?;
-        if destination.exists() && std::fs::read(&destination).map_err(AppError::from)? != bytes {
-            return Err(AppError::Validation("这个目录使用了其他加密密钥。\n请选择空目录。".into()));
-        }
-    }
-    for name in ["master.key", "master.key.dpapi"] {
-        let source = old_path_buf.join(name);
-        let destination = new_data_path.join(name);
-        if source.exists() && !destination.exists() {
-            use std::io::Write;
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
-            let mut output = options.open(&destination).map_err(AppError::from)?;
-            output.write_all(&std::fs::read(&source).map_err(AppError::from)?).map_err(AppError::from)?;
-            output.sync_all().map_err(AppError::from)?;
-        }
-    }
-
-    // 1. Migrate data folders if they exist in the OLD path
-    {
-        for folder in ["attachments", "favorites"] {
-            let old_folder = old_path_buf.join(folder);
-            let new_folder = new_data_path.join(folder);
-
-            if old_folder.exists() && old_folder.is_dir() {
-                if let Err(_) = std::fs::rename(&old_folder, &new_folder) {
-                    if let Err(copy_err) = copy_dir_recursive(&old_folder, &new_folder) {
-                        return Err(AppError::Internal(format!(
-                            "Failed to copy {}: {}",
-                            folder, copy_err
-                        )));
-                    } else {
-                        let _ = std::fs::remove_dir_all(&old_folder);
-                    }
-                }
-            }
-        }
-
-        // 1.2 Migrate database files (main + WAL/SHM)
-        let db_files = ["clipboard.db", "clipboard.db-wal", "clipboard.db-shm"];
-        for name in db_files {
-            let old_db = old_path_buf.join(name);
-            if !old_db.exists() {
-                continue;
-            }
-            let new_db = new_data_path.join(name);
-            if new_db.exists() {
-                // Avoid overwriting any existing DB in new path
-                let backup = new_data_path.join(format!("{}.backup", name));
-                if backup.exists() {
-                    let _ = std::fs::remove_file(&backup);
-                }
-                let _ = std::fs::rename(&new_db, &backup);
-            }
-            if let Err(_) = std::fs::rename(&old_db, &new_db) {
-                if let Err(copy_err) = std::fs::copy(&old_db, &new_db) {
-                    return Err(AppError::Internal(format!(
-                        "Failed to copy {}: {}",
-                        name, copy_err
-                    )));
-                } else {
-                    let _ = std::fs::remove_file(&old_db);
-                }
-            }
-        }
-    }
-
-    // 1.3 Rewrite internal attachment paths inside DB (if DB exists in new path)
-    let new_db_path = new_data_path.join("clipboard.db");
-    if new_db_path.exists() {
-        rewrite_attachment_paths_in_db(&new_db_path, &old_path_buf, new_data_path)?;
-        rewrite_custom_background_in_db(&new_db_path, &old_path_buf, new_data_path)?;
-    }
-
-    // 2. Save new path to a persistent config file
-    let config_dir = crate::app::setup::default_app_data_dir(app_handle.path()).map_err(AppError::from)?;
-    if !config_dir.exists() {
-        std::fs::create_dir_all(&config_dir).map_err(AppError::from)?;
-    }
-
-    let redirect_file = config_dir.join("datapath.txt");
-    std::fs::write(&redirect_file, &clean_path).map_err(AppError::from)?;
-
-    Ok(())
-}
-
-fn rewrite_attachment_paths_in_db(
-    db_path: &std::path::Path,
-    old_base: &std::path::Path,
-    new_base: &std::path::Path,
-) -> AppResult<()> {
-    let old_attach = old_base.join("attachments");
-    let new_attach = new_base.join("attachments");
-    let old_prefix = old_attach.to_string_lossy().to_string();
-    let new_prefix = new_attach.to_string_lossy().to_string();
-    if old_prefix == new_prefix {
-        return Ok(());
-    }
-
-    let old_prefix_slash = old_prefix.replace('\\', "/");
-    let new_prefix_slash = new_prefix.replace('\\', "/");
-
-    let conn = Connection::open(db_path).map_err(AppError::from)?;
-
-    let mut stmt = conn
-        .prepare("SELECT id, content, html_content FROM clipboard_history WHERE is_external = 1 OR html_content IS NOT NULL")
-        .map_err(AppError::from)?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let content: String = row.get(1)?;
-            let html_content: Option<String> = row.get(2)?;
-            Ok((id, content, html_content))
-        })
-        .map_err(AppError::from)?;
-
-    for row in rows {
-        let (id, content_raw, html_raw) = row.map_err(AppError::from)?;
-        let mut content_new: Option<String> = None;
-        let mut html_new: Option<String> = None;
-
-        if let Some(updated) = rewrite_content_path(
-            &content_raw,
-            &old_prefix,
-            &new_prefix,
-            &old_prefix_slash,
-            &new_prefix_slash,
-        ) {
-            content_new = Some(updated);
-        }
-
-        if let Some(html) = html_raw.as_ref() {
-            if let Some(updated) = rewrite_html_paths(
-                html,
-                &old_prefix,
-                &new_prefix,
-                &old_prefix_slash,
-                &new_prefix_slash,
-            ) {
-                html_new = Some(updated);
-            }
-        }
-
-        if content_new.is_some() || html_new.is_some() {
-            let content_final = content_new.as_ref().unwrap_or(&content_raw);
-            let html_final = match html_new.as_ref() {
-                Some(v) => Some(v.as_str()),
-                None => html_raw.as_deref(),
-            };
-            conn.execute(
-                "UPDATE clipboard_history SET content = ?1, html_content = ?2 WHERE id = ?3",
-                params![content_final, html_final, id],
-            )
-            .map_err(AppError::from)?;
-        }
-    }
-
-    Ok(())
-}
-
-
-fn rewrite_custom_background_in_db(
-    db_path: &std::path::Path,
-    old_base: &std::path::Path,
-    new_base: &std::path::Path,
-) -> AppResult<()> {
-    let conn = Connection::open(db_path).map_err(AppError::from)?;
-    let value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'app.custom_background'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(AppError::from)?;
-
-    let Some(raw_path) = value else {
-        return Ok(());
-    };
-    let trimmed = raw_path.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-
-    let old_path = std::path::PathBuf::from(trimmed);
-    if !old_path.starts_with(old_base) {
-        return Ok(());
-    }
-
-    let Ok(relative) = old_path.strip_prefix(old_base) else {
-        return Ok(());
-    };
-    let new_path = new_base.join(relative);
-
-    if old_path != new_path && old_path.exists() {
-        if let Some(parent) = new_path.parent() {
-            std::fs::create_dir_all(parent).map_err(AppError::from)?;
-        }
-        if !new_path.exists() {
-            if let Err(_) = std::fs::rename(&old_path, &new_path) {
-                std::fs::copy(&old_path, &new_path).map_err(AppError::from)?;
-                let _ = std::fs::remove_file(&old_path);
-            }
-        }
-    }
-
-    let new_value = new_path.to_string_lossy().to_string();
-    if new_value != raw_path {
-        conn.execute(
-            "UPDATE settings SET value = ?1 WHERE key = 'app.custom_background'",
-            params![new_value],
-        )
-        .map_err(AppError::from)?;
-    }
-
-    Ok(())
-}
-
-fn rewrite_content_path(
-    value: &str,
-    old_prefix: &str,
-    new_prefix: &str,
-    old_prefix_slash: &str,
-    new_prefix_slash: &str,
-) -> Option<String> {
-    let replace_prefix = |v: &str| -> Option<String> {
-        if v.starts_with(old_prefix) {
-            return Some(format!("{}{}", new_prefix, &v[old_prefix.len()..]));
-        }
-        if v.starts_with(old_prefix_slash) {
-            return Some(format!(
-                "{}{}",
-                new_prefix_slash,
-                &v[old_prefix_slash.len()..]
-            ));
-        }
-        None
-    };
-
-    if crate::infrastructure::encryption::is_encrypted_value(value) {
-        #[cfg(not(feature = "portable"))]
-        {
-            let plain = crate::database::encryption::decrypt_value(value)
-                .unwrap_or_else(|| value.to_string());
-            if let Some(updated_plain) = replace_prefix(&plain) {
-                let encrypted = crate::database::encryption::encrypt_value(&updated_plain)
-                    .unwrap_or(updated_plain);
-                return Some(encrypted);
-            }
-        }
-        return None;
-    }
-
-    replace_prefix(value)
-}
-
-fn rewrite_html_paths(
-    value: &str,
-    old_prefix: &str,
-    new_prefix: &str,
-    old_prefix_slash: &str,
-    new_prefix_slash: &str,
-) -> Option<String> {
-    let replace_any = |v: &str| -> Option<String> {
-        let mut updated = v.replace(old_prefix, new_prefix);
-        updated = updated.replace(old_prefix_slash, new_prefix_slash);
-        if updated == v {
-            None
-        } else {
-            Some(updated)
-        }
-    };
-
-    if crate::infrastructure::encryption::is_encrypted_value(value) {
-        #[cfg(not(feature = "portable"))]
-        {
-            let plain = crate::database::encryption::decrypt_value(value)
-                .unwrap_or_else(|| value.to_string());
-            if let Some(updated_plain) = replace_any(&plain) {
-                let encrypted = crate::database::encryption::encrypt_value(&updated_plain)
-                    .unwrap_or(updated_plain);
-                return Some(encrypted);
-            }
-        }
-        return None;
-    }
-
-    replace_any(value)
-}
-
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    if !dst.exists() {
-        std::fs::create_dir_all(dst)?;
-    }
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
+    let source = app_handle.state::<AppDataDir>().0.lock().unwrap().clone();
+    let config = crate::app::setup::default_app_data_dir(app_handle.path())?;
+    crate::app::data_directory::request_move(&config, &source, std::path::Path::new(new_path.trim()))
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -633,5 +308,23 @@ pub fn open_macos_accessibility_settings() -> AppResult<()> {
         return Err(AppError::Internal(
             "请手动打开系统「辅助功能」设置。".to_string(),
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn launcher_waits_until_the_original_process_has_exited() {
+        let folder = std::env::temp_dir().join(format!("copypaste-launch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&folder).unwrap();
+        let marker = folder.join("launched");
+        let mut original = std::process::Command::new("/bin/sleep").arg("0.25").spawn().unwrap();
+        let mut replacement = super::launch_after_exit(original.id(), std::path::Path::new("/usr/bin/touch"))
+            .arg(&marker).spawn().unwrap();
+        assert!(!marker.exists());
+        assert!(original.wait().unwrap().success());
+        assert!(replacement.wait().unwrap().success());
+        assert!(marker.is_file());
+        std::fs::remove_dir_all(folder).unwrap();
     }
 }

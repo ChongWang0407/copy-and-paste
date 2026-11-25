@@ -85,6 +85,7 @@ impl ClipboardPipeline {
     }
 
     pub fn execute(&self, context: &mut PipelineContext) {
+        let _attachments = crate::database::ATTACHMENT_WRITERS.read().unwrap();
         for stage in &self.stages {
             stage.process(context);
             if context.should_stop {
@@ -668,58 +669,44 @@ fn complete_remote_images(job: RemoteImagesJob) {
     }
 }
 
-/// Where session-only mode (persistence off) keeps images: `<data>/session`,
-/// emptied at startup and as entries leave the session history.
-pub fn session_storage_root(data_dir: &std::path::Path) -> std::path::PathBuf {
-    data_dir.join("session")
-}
+use crate::app::data_directory::session_storage_root;
 
 /// Delete session-only image files no session entry shows any more. Entries
 /// leave the session history in many ways (delete, clear, tag delete, the
 /// 500-item cap, paste-and-delete); sweeping by reference catches all of them.
 /// Run right after user deletes, and every 30 s by start_session_file_sweeper.
 pub fn sweep_session_files(app: &tauri::AppHandle) {
-    let data_dir = app.state::<AppDataDir>().0.lock().unwrap().clone();
-    let attachments = session_storage_root(&data_dir).join("attachments");
-    let Ok(files) = std::fs::read_dir(&attachments) else {
+    let Ok(_attachments) = crate::database::ATTACHMENT_WRITERS.try_write() else {
         return;
     };
+    let data_dir = app.state::<AppDataDir>().0.lock().unwrap().clone();
     let session = app.state::<SessionHistory>();
     let session = session.0.lock().unwrap();
-    for file in files.flatten() {
-        let path = file.path();
-        let name = file.file_name().to_string_lossy().to_string();
-        if !name.starts_with("img_") {
-            continue;
+    let db = app.state::<DbState>();
+    let conn = db.conn.lock().unwrap();
+    let root = session_storage_root(&data_dir);
+    let attachments = root.join("attachments");
+    let mut candidates = Vec::new();
+    if crate::app::data_directory::owns_session(&root)
+        && attachments.symlink_metadata().is_ok_and(|meta| meta.is_dir())
+    {
+        if let Ok(files) = std::fs::read_dir(attachments) {
+            candidates.extend(files.flatten().filter(|file| {
+                file.file_type().is_ok_and(|kind| kind.is_file())
+            }).map(|file| file.path()));
         }
-        if !session.iter().any(|entry| {
-            entry.content.contains(&name)
-                || entry
-                    .html_content
-                    .as_ref()
-                    .is_some_and(|html| html.contains(&name))
-        }) {
-            crate::database::remove_idle_attachment(&path);
-        }
+    }
+    if let Err(error) = db.repo.sweep_attachment_deletions(&conn, &data_dir, candidates, session.iter()) {
+        crate::error!(">>> [ATTACHMENTS] {error}");
     }
 }
 
 /// Startup: the previous run's session images are unreachable now; delete
 /// them, then keep sweeping while the app runs.
-pub fn start_session_file_sweeper(app: tauri::AppHandle, data_dir: &std::path::Path) {
-    let root = session_storage_root(data_dir);
-    if let Ok(files) = std::fs::read_dir(root.join("attachments")) {
-        for file in files
-            .flatten()
-            .filter(|file| file.file_name().to_string_lossy().starts_with("img_"))
-        {
-            crate::app::commands::thumbnail_cmd::remove_cached_thumbnails(&file.path());
-        }
-    }
-    let _ = std::fs::remove_dir_all(root);
+pub fn start_session_file_sweeper(app: tauri::AppHandle) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(30));
         sweep_session_files(&app);
+        std::thread::sleep(std::time::Duration::from_secs(30));
     });
 }
 

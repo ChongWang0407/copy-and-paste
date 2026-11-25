@@ -307,7 +307,7 @@ pub fn reset_settings(
         seed_defaults(&conn).map_err(AppError::from)?;
     }
     // Running state follows the defaults now, not after the next start.
-    let fresh = crate::app::setup::load_settings(&state.settings_repo);
+    let fresh = crate::app::setup::load_settings(&state.settings_repo)?;
     settings_state.take_values_from(crate::app::setup::settings_state_from(&fresh));
     panel::refresh_clipboard_panel_policy(&app)
         .map_err(|error| AppError::Internal(error.to_string()))?;
