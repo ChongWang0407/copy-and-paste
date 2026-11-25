@@ -1024,8 +1024,18 @@ p {
   gap: 7px;
 }
 
-/* 常用语 / 常用图, styled like the type tabs on the left. Its line lands at
-   the same height as the left toolbar's, so the two sides read as one row:
+/* 常用语 / 图片与文件 and, when tags are in use, the tag filter: one block
+   that does not scroll, with the line under it. */
+.favorite-toolbar {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 8px;
+  border-bottom: 0.5px solid var(--glass-line);
+}
+
+/* Styled like the type tabs on the left. Without tags its line lands at the
+   same height as the left toolbar's, so the two sides read as one row:
    header 46 + 9 + tab 27 = 82, the search box's bottom edge. */
 .favorite-tabs {
   flex: none;
@@ -1033,8 +1043,65 @@ p {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
   padding: 9px var(--space-page) 10px;
-  margin-bottom: 8px;
-  border-bottom: 0.5px solid var(--glass-line);
+}
+
+/* One row that scrolls sideways; the wheel scrolls it too. */
+.favorite-tag-bar {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 var(--space-page) 9px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.favorite-tag-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.favorite-tag-bar.has-overflow-right {
+  -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 16px), transparent 100%);
+  mask-image: linear-gradient(90deg, #000 calc(100% - 16px), transparent 100%);
+}
+
+.favorite-tag-bar.has-overflow-left {
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 16px);
+  mask-image: linear-gradient(90deg, transparent 0, #000 16px);
+}
+
+.favorite-tag-bar.has-overflow-left.has-overflow-right {
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%);
+}
+
+.favorite-tag-pill {
+  flex: none;
+  height: 24px;
+  max-width: 120px;
+  padding: 0 9px;
+  border-radius: 12px;
+  font-size: 11.5px;
+  font-weight: 550;
+  line-height: 24px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+  background: var(--glass-fill);
+  box-shadow: var(--glass-highlight), 0 0 0 0.5px var(--glass-line);
+  transition: background 0.14s ease, color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.favorite-tag-pill:hover {
+  color: var(--text-primary);
+  background: var(--glass-fill-hover);
+}
+
+.favorite-tag-pill.is-active {
+  color: #fff;
+  background: linear-gradient(180deg, var(--accent-light), var(--accent-mid));
+  box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.5), 0 1px 3px rgba(var(--accent-strong-rgb), 0.26);
 }
 
 .favorite-media.is-image {
@@ -1051,11 +1118,12 @@ p {
 }
 
 .favorite-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 6px;
   min-height: 42px;
-  padding: 7px 8px 7px 4px;
+  padding: 8px 10px 8px 4px;
   border-radius: var(--radius-control);
   background: var(--glass-fill);
   box-shadow: var(--glass-highlight), 0 0 0 0.5px var(--glass-line), var(--glass-shadow);
@@ -1085,6 +1153,69 @@ p {
   cursor: grabbing;
 }
 
+/* With a title, tags or a picture the grip sits at the top, not mid-card. */
+.favorite-item.has-title,
+.favorite-item.has-tags,
+.favorite-item.is-image {
+  align-items: flex-start;
+}
+
+/* Title above, content in the middle, tags below. */
+.favorite-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.favorite-body > .favorite-text,
+.favorite-body > .favorite-media {
+  flex: none;
+}
+
+.favorite-item-title {
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 18px;
+  color: var(--text-primary);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.favorite-card-tags {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  margin-top: 1px;
+}
+
+.favorite-card-tag {
+  flex: 0 1 auto;
+  max-width: 88px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 550;
+  line-height: 18px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+
+.favorite-card-tag.is-more {
+  flex: none;
+  color: var(--text-tertiary);
+  background: rgba(0, 0, 0, 0.06);
+}
+
 .favorite-text {
   flex: 1;
   min-width: 0;
@@ -1100,6 +1231,14 @@ p {
 .favorite-text.is-code {
   font-family: var(--font-mono);
   font-size: 12px;
+}
+
+/* Under a title the content is the secondary line. */
+.favorite-text.has-title,
+.favorite-media.has-title .favorite-name {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--text-secondary);
 }
 
 .favorite-media {
@@ -1152,28 +1291,211 @@ p {
   text-overflow: ellipsis;
 }
 
+/* Floats at the top right, so the content keeps the card's full width;
+   shown on hover and when a button in it has keyboard focus. */
 .favorite-actions {
-  flex: none;
+  position: absolute;
+  top: 6px;
+  right: 6px;
   display: flex;
   gap: 4px;
+  padding: 2px;
+  border-radius: 12px;
+  background: rgba(250, 250, 252, 0.84);
+  -webkit-backdrop-filter: blur(12px) saturate(160%);
+  backdrop-filter: blur(12px) saturate(160%);
+  box-shadow: 0 0 0 0.5px var(--glass-line), 0 2px 6px rgba(0, 0, 0, 0.08);
   opacity: 0;
+  pointer-events: none;
   transition: opacity 0.12s ease;
 }
 
-.favorite-item:hover .favorite-actions {
+.favorite-item:hover .favorite-actions,
+.favorite-item:focus-within .favorite-actions {
   opacity: 1;
+  pointer-events: auto;
+}
+
+.favorite-item:focus-within .card-action {
+  color: var(--pill-ink);
+  background: linear-gradient(180deg, rgba(var(--pill-rgb), 0.2), rgba(var(--pill-rgb), 0.12));
+  box-shadow: var(--glass-highlight), 0 0 0 0.5px rgba(var(--pill-rgb), 0.34);
 }
 
 .favorite-editor {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
+  padding: 9px;
   margin-bottom: 7px;
+  border-radius: var(--radius-control);
+  background: var(--glass-fill-hover);
+  box-shadow: var(--glass-highlight), 0 0 0 1px rgba(var(--accent-rgb), 0.36), var(--glass-shadow);
+}
+
+/* In a row, the list's gap already spaces it. */
+.favorite-row .favorite-editor {
+  margin-bottom: 0;
+}
+
+.favorite-editor-media {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.favorite-editor-thumb {
+  flex: none;
+  width: 48px;
+  height: 36px;
+  object-fit: cover;
+  border-radius: 6px;
+  box-shadow: 0 0 0 0.5px var(--glass-line);
+}
+
+.favorite-editor-media-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.favorite-editor-media-name {
+  font-size: 12.5px;
+  font-weight: 550;
+  color: var(--text-primary);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.favorite-editor-media-hint {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+
+.favorite-title-input {
+  height: 32px;
+  font-size: 13px;
+  font-weight: 550;
+}
+
+/* Chosen tags and the tag input, in one box that looks like a field. */
+.favorite-tag-box {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+  padding: 4px 7px;
+  border-radius: var(--radius-small);
+  background: var(--glass-fill);
+  box-shadow: var(--glass-highlight), 0 0 0 0.5px var(--glass-line-strong), inset 0 1px 2px rgba(0, 0, 0, 0.04);
+  transition: box-shadow 0.14s ease, background 0.14s ease;
+}
+
+.favorite-tag-box:focus-within {
+  background: var(--glass-fill-hover);
+  box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.7), 0 0 0 3px rgba(var(--accent-rgb), 0.16);
+}
+
+.favorite-tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 22px;
+  max-width: 148px;
+  padding: 0 5px 0 7px;
+  border-radius: 11px;
+  font-size: 11.5px;
+  font-weight: 550;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+
+.favorite-tag-chip-text {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.favorite-tag-chip-remove {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: var(--accent-strong);
+}
+
+.favorite-tag-chip-remove:hover {
+  background: rgba(var(--accent-rgb), 0.22);
+}
+
+.favorite-tag-input {
+  flex: 1 1 88px;
+  min-width: 88px;
+  height: 22px;
+  border: 0;
+  padding: 0 2px;
+  background: transparent;
+  font-size: 12px;
+}
+
+.favorite-tag-input:focus,
+.favorite-tag-input:focus-visible {
+  outline: none;
+}
+
+.favorite-tag-input::placeholder {
+  color: var(--text-tertiary);
+}
+
+/* Tags already in use, at most two rows before it scrolls. */
+.favorite-tag-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 56px;
+  overflow-y: auto;
+}
+
+.favorite-tag-suggestion {
+  flex: none;
+  max-width: 120px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 11px;
+  font-size: 11px;
+  font-weight: 550;
+  line-height: 22px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-secondary);
+  background: var(--glass-fill);
+  box-shadow: 0 0 0 0.5px var(--glass-line);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.favorite-tag-suggestion:hover:not(:disabled) {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 0.5px rgba(var(--accent-rgb), 0.35);
+}
+
+.favorite-tag-suggestion:disabled {
+  opacity: 0.45;
 }
 
 .favorite-textarea {
   min-height: 84px;
+  max-height: 220px;
   resize: vertical;
+  font-size: 13px;
+  line-height: 18px;
 }
 
 .favorite-editor-actions {

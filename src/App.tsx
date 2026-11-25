@@ -268,8 +268,13 @@ const App = () => {
 
   const leaveSettings = useCallback(() => setShowSettings(false), []);
 
+  // 常用's editor: Esc closes it before the panel, so unsaved text isn't lost.
+  const [favoriteEditing, setFavoriteEditing] = useState(false);
+  const favoriteCancelEditRef = useRef<(() => boolean) | null>(null);
+
   const dismiss = useCallback(() => {
     if (settingFixedPosition) return true;
+    if (panel.kind === "favorites" && favoriteCancelEditRef.current?.()) return true;
     if (panel.kind) {
       closeSidePanel();
       return true;
@@ -290,8 +295,9 @@ const App = () => {
     return false;
   }, [closeSidePanel, draft, leaveSettings, panel.kind, search, selectedIndex, settingFixedPosition, showSettings]);
 
-  // 编辑 and 翻译 take typing: the list's keys stay off while they are open.
-  const typingInPanel = panel.kind === "edit" || panel.kind === "translate";
+  // 编辑, 翻译 and 常用's editor take typing: the list's keys stay off while they are open.
+  const typingInPanel =
+    panel.kind === "edit" || panel.kind === "translate" || (panel.kind === "favorites" && favoriteEditing);
 
   useKeyboard({
     items,
@@ -545,7 +551,13 @@ const App = () => {
       {panel.kind && (
         <aside className="side-panel">
           {panel.kind === "favorites" && (
-            <FavoritesPanel t={t} pushToast={pushToast} onPasteFailed={failed} />
+            <FavoritesPanel
+              t={t}
+              pushToast={pushToast}
+              onPasteFailed={failed}
+              onEditingChange={setFavoriteEditing}
+              cancelEditRef={favoriteCancelEditRef}
+            />
           )}
           {panel.kind === "edit" && editing && (
             <EditPanel

@@ -485,7 +485,16 @@ fn ensure_fork_schema(conn: &Connection) -> Result<()> {
              path TEXT PRIMARY KEY,
              delete_after INTEGER NOT NULL
          );
-         CREATE TABLE IF NOT EXISTS fork_migrations (name TEXT PRIMARY KEY);",
+         CREATE TABLE IF NOT EXISTS fork_migrations (name TEXT PRIMARY KEY);
+         -- Titles and tags of favorites, beside the upstream table. A row whose
+         -- favorite_created_at no longer matches belongs to a deleted favorite.
+         CREATE TABLE IF NOT EXISTS cp_fork_favorite_meta (
+             favorite_id INTEGER PRIMARY KEY,
+             favorite_created_at INTEGER NOT NULL,
+             title TEXT NOT NULL DEFAULT '',
+             tags TEXT NOT NULL DEFAULT '[]',
+             updated_at INTEGER NOT NULL
+         );",
     )
 }
 
@@ -564,6 +573,56 @@ mod tests {
         assert_eq!(image[0].id, 3);
         assert!(image[0].ocr_match);
         assert_eq!(repo.search_filtered("needle", 1, false, false, Some("text")).unwrap()[0].id, 2);
+    }
+
+    #[test]
+    fn schema_21_favorites_survive_the_meta_table_and_list_without_titles() {
+        use crate::infrastructure::repository::favorites_repo;
+        let conn = Connection::open_in_memory().unwrap();
+        run_upstream_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO favorites
+                (id, content_type, content, html_content, preview, source_app, sort_order, created_at, updated_at)
+             VALUES
+                (1, 'text', 'hello', NULL, 'hello', '', 1, 100, 100),
+                (2, 'text', '  多行\n第二行  ', NULL, '多行 第二行', 'Notes', 2, 101, 150),
+                (3, 'rich_text', 'bold', '<b>bold</b><img src=\"/x/attachments/a.png\">', 'bold', 'Pages', 3, 102, 102),
+                (4, 'code', 'fn main() {}', NULL, 'fn main() {}', 'Xcode', 4, 103, 103),
+                (5, 'url', 'https://example.com', NULL, 'https://example.com', 'Safari', 5, 104, 104),
+                (6, 'text', '😀 emoji', NULL, '😀 emoji', '', 6, 105, 105),
+                (7, 'text', 'enc1:looks-encrypted', NULL, 'enc1:looks-encrypted', '', 7, 106, 106),
+                (8, 'image', 'f1/shot.png', NULL, 'Image', 'Preview', 8, 107, 107),
+                (9, 'video', 'f2/clip.mov', NULL, 'Video', 'QuickTime', 9, 108, 108),
+                (10, 'file', 'f3/a.pdf\nf3/b.pdf', NULL, 'a.pdf', 'Finder', 10, 109, 109);",
+        ).unwrap();
+
+        fn rows(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+            let mut stmt = conn.prepare(
+                "SELECT id, content_type, content, html_content, preview, source_app, sort_order,
+                        created_at, updated_at FROM favorites ORDER BY id",
+            ).unwrap();
+            stmt.query_map([], |row| (0..9).map(|column| row.get(column)).collect())
+                .unwrap().collect::<Result<_>>().unwrap()
+        }
+        let before = rows(&conn);
+        let versions = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row.get(0)).unwrap()
+        };
+        let version = versions(&conn);
+        for _ in 0..2 {
+            run_migrations(&conn).unwrap();
+            assert_eq!(rows(&conn), before);
+            assert_eq!(versions(&conn), version, "the fork never takes a schema version");
+        }
+        let listed = favorites_repo::list(&conn).unwrap();
+        assert_eq!(listed.len(), 10);
+        for favorite in &listed {
+            assert_eq!(favorite.title, "");
+            assert!(favorite.tags.is_empty());
+        }
+        assert_eq!(listed[6].content, "enc1:looks-encrypted");
+        assert_eq!(listed[2].html_content.as_deref(), Some("<b>bold</b><img src=\"/x/attachments/a.png\">"));
+        assert_eq!(rows(&conn), before, "listing writes nothing to favorites");
     }
 
     #[test]
