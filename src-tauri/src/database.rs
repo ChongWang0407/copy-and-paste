@@ -10,6 +10,10 @@ use crate::infrastructure::repository::settings_repo::SqliteSettingsRepository;
 use crate::infrastructure::repository::tag_repo::SqliteTagRepository;
 use std::sync::{Arc, Mutex};
 
+// Acquired before session/database locks. Writers hold a read guard until
+// their file reference is committed. Cleanup only runs with a write guard.
+pub(crate) static ATTACHMENT_WRITERS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 pub struct DbState {
     /// Lock order: take SessionHistory or AppDataDir first, then this.
     /// Never wait for another lock while holding the connection (the repo

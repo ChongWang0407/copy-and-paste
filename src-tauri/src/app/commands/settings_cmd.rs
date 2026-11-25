@@ -299,7 +299,7 @@ pub fn reset_settings(
         seed_defaults(&conn).map_err(AppError::from)?;
     }
     // Running state follows the defaults now, not after the next start.
-    let fresh = crate::app::setup::load_settings(&state.settings_repo);
+    let fresh = crate::app::setup::load_settings(&state.settings_repo)?;
     settings_state.take_values_from(crate::app::setup::settings_state_from(&fresh));
     *crate::global_state::HOTKEY_STRING.lock().unwrap() = fresh.main_hotkey.clone();
     // The window applies the rest when it reloads, but not these two.

@@ -242,28 +242,11 @@ async fn copy_to_clipboard_inner(
 
     let mut html_content: Option<String> = None;
 
-    // 0. Resolve full content if ID is provided and content is placeholder/truncated
     if id != 0 {
-        if id > 0 {
-            // Fetch from Database
-            if let Ok(Some((full_content, ctype, html))) =
-                state.repo.get_entry_content_with_html(id)
-            {
-                content = full_content;
-                html_content = html;
-                content_type = ctype;
-            }
-        } else {
-            // Fetch from Session
-            let session_items = session.0.lock().unwrap();
-            if let Some(item) = session_items.iter().find(|i| i.id == id) {
-                content = item.content.clone();
-                html_content = item.html_content.clone();
-                content_type = item.content_type.clone();
-            }
-        }
+        (content, content_type, html_content) = entry_full(&app_handle, &state, &session, id)?;
+    } else {
+        content = with_current_entry_file(&app_handle, &content_type, content);
     }
-    content = with_current_entry_file(&app_handle, &content_type, content);
 
     // 1. Handle Window Visibility and Focus
     if paste {
@@ -343,9 +326,9 @@ fn entry_full(
     state: &DbState,
     session: &SessionHistory,
     id: i64,
-) -> Option<(String, String, Option<String>)> {
+) -> AppResult<(String, String, Option<String>)> {
     let entry = if id > 0 {
-        state.repo.get_entry_content_with_html(id).ok().flatten()
+        state.repo.get_entry_content_with_html(id)?
     } else {
         let items = session.0.lock().unwrap();
         items
@@ -353,9 +336,8 @@ fn entry_full(
             .find(|item| item.id == id)
             .map(|item| (item.content.clone(), item.content_type.clone(), item.html_content.clone()))
     };
-    entry.map(|(content, kind, html)| {
-        (with_current_entry_file(app_handle, &kind, content), kind, html)
-    })
+    let (content, kind, html) = entry.ok_or_else(|| AppError::Validation("Item not found".to_string()))?;
+    Ok((with_current_entry_file(app_handle, &kind, content), kind, html))
 }
 
 async fn paste_plain_string(
@@ -424,8 +406,7 @@ pub async fn paste_entry_as_markdown(
     move_to_top: Option<bool>,
 ) -> AppResult<()> {
     let _paste_guard = PASTE_LOCK.lock().await;
-    let (content, content_type, html) = entry_full(&app_handle, &state, &session, id)
-        .ok_or_else(|| AppError::Validation("Item not found".to_string()))?;
+    let (content, content_type, html) = entry_full(&app_handle, &state, &session, id)?;
     let markdown = crate::services::markdown::entry_to_markdown(&content, &content_type, html.as_deref());
     paste_plain_string(
         &app_handle,
@@ -525,8 +506,7 @@ pub async fn paste_batch(
                 prepare_clipboard_payload(&text, "text", None, false).await?;
             }
             BatchSegment::Entry { id } => {
-                let (content, content_type, html) = entry_full(&app_handle, &state, &session, id)
-                    .ok_or_else(|| AppError::Validation("Item not found".to_string()))?;
+                let (content, content_type, html) = entry_full(&app_handle, &state, &session, id)?;
                 prepare_clipboard_payload(&content, &content_type, html.as_deref(), html.is_some())
                     .await?;
             }
@@ -1050,25 +1030,21 @@ fn handle_post_paste_actions(
     delete_after_use: bool,
     move_to_top: Option<bool>,
 ) -> AppResult<()> {
+    if id == 0 {
+        return Ok(());
+    }
     if delete_after_use {
         // Fetch metadata to check for pinned or tagging protection
-        let is_protected = if id != 0 {
-            if id > 0 {
-                state
-                    .repo
-                    .get_entry_by_id(id)
-                    .map(|e| e.is_some_and(|i| i.is_pinned || !i.tags.is_empty()))
-                    .unwrap_or(false)
-            } else {
-                let session = app_handle.state::<crate::app_state::SessionHistory>();
-                let s = session.0.lock().unwrap();
-                s.iter()
-                    .find(|i| i.id == id)
-                    .map(|i| i.is_pinned || !i.tags.is_empty())
-                    .unwrap_or(false)
-            }
+        let is_protected = if id > 0 {
+            state
+                .repo
+                .get_entry_by_id(id)?
+                .is_some_and(|entry| entry.is_pinned || !entry.tags.is_empty())
         } else {
-            false
+            let session = app_handle.state::<SessionHistory>();
+            let items = session.0.lock().unwrap();
+            items.iter().find(|entry| entry.id == id)
+                .is_some_and(|entry| entry.is_pinned || !entry.tags.is_empty())
         };
 
         if !is_protected {
@@ -1084,7 +1060,7 @@ fn handle_post_paste_actions(
             if id > 0 {
                 // Cleanup persistent file and DB entry if needed
                 let app_data = app_handle.state::<crate::app_state::AppDataDir>();
-                let data_dir = app_data.0.lock().unwrap();
+                let data_dir = app_data.0.lock().unwrap().clone();
 
                 if state.repo.delete_after_paste(id, Some(&data_dir)).is_ok() {
                     let _ = app_handle.emit("clipboard-removed", id);
@@ -1092,24 +1068,37 @@ fn handle_post_paste_actions(
             } else {
                 let _ = app_handle.emit("clipboard-removed", id);
             }
+            return Ok(());
         }
-    } else if id > 0 {
+    }
+    if id > 0 {
         let _ = state.repo.increment_use_count(id);
+    }
+    let should_move_to_top = match move_to_top {
+        Some(value) => value,
+        None => state.settings_repo.get("app.move_to_top_after_paste")?.as_deref() == Some("true"),
+    };
 
-        let should_move_to_top = match move_to_top {
-            Some(val) => val,
-            None => state
-                .settings_repo
-                .get("app.move_to_top_after_paste")
-                .ok()
-                .flatten()
-                .map(|v| v == "true")
-                .unwrap_or(false),
-        };
-
-        if should_move_to_top {
-            let _ = state.repo.touch_entry(id, Utc::now().timestamp_millis());
+    let now = Utc::now().timestamp_millis();
+    let reordered = if id > 0 {
+        should_move_to_top && state.repo.touch_entry(id, now).is_ok()
+    } else {
+        let session = app_handle.state::<SessionHistory>();
+        let mut items = session.0.lock().unwrap();
+        if let Some(entry) = items.iter_mut().find(|entry| entry.id == id) {
+            entry.use_count += 1;
+            entry.last_used_at = now;
+            if should_move_to_top {
+                entry.timestamp = now;
+                entry.sort_at = now;
+            }
+            should_move_to_top
+        } else {
+            false
         }
+    };
+    if reordered {
+        let _ = app_handle.emit("clipboard-changed", ());
     }
 
     Ok(())

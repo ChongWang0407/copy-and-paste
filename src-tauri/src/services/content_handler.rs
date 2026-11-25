@@ -290,6 +290,7 @@ pub fn register_file_preview_watch(
                 } else if let Some((new_content, preview)) =
                     read_changed_file(&file_path, &content_type)
                 {
+                    let _attachments = crate::database::ATTACHMENT_WRITERS.read().unwrap();
                     let new_content = store_edited_image(&app_handle, id, &content_type, new_content);
                     update_database_with_changes(&app_handle, id, &new_content, &preview);
                 }
@@ -725,7 +726,7 @@ fn store_edited_image(
     // Database entries (id > 0, e.g. pinned while persistence is off) keep
     // their files in attachments/; only session entries use session/, which
     // is swept once no session entry shows the file.
-    let root = if id > 0 { data_dir.clone() } else { data_dir.join("session") };
+    let root = if id > 0 { data_dir.clone() } else { crate::app::data_directory::session_storage_root(&data_dir) };
     crate::database::save_image_to_file(&content, &root).unwrap_or(content)
 }
 

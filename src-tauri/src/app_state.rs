@@ -111,15 +111,15 @@ mod tests {
         conn.execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .unwrap();
         let repo = SqliteSettingsRepository::new(Arc::new(Mutex::new(conn)));
-        let defaults = settings_state_from(&load_settings(&repo));
+        let defaults = settings_state_from(&load_settings(&repo).unwrap());
         repo.set("app.delete_after_paste", "true").unwrap();
         repo.set("app.cleanup_rules", "secret => ").unwrap();
         repo.set("app.hotkey", "Ctrl+Shift+K").unwrap();
-        let running = settings_state_from(&load_settings(&repo));
+        let running = settings_state_from(&load_settings(&repo).unwrap());
         assert!(running.delete_after_paste.load(Ordering::Relaxed));
 
         repo.clear().unwrap();
-        running.take_values_from(settings_state_from(&load_settings(&repo)));
+        running.take_values_from(settings_state_from(&load_settings(&repo).unwrap()));
 
         assert!(!running.delete_after_paste.load(Ordering::Relaxed));
         assert_eq!(*running.cleanup_rules.lock().unwrap(), *defaults.cleanup_rules.lock().unwrap());

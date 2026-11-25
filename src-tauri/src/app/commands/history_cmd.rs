@@ -2,9 +2,9 @@ use crate::app_state::{AppDataDir, SessionHistory};
 use crate::database::DbState;
 use crate::domain::models::ClipboardEntry;
 use crate::error::{AppError, AppResult};
-use crate::infrastructure::repository::clipboard_repo::{ClipboardRepository, ClipboardSortMode};
+use crate::infrastructure::repository::clipboard_repo::{matches_type, ClipboardRepository, ClipboardSortMode};
 use crate::infrastructure::repository::tag_repo::TagRepository;
-use crate::services::clipboard::{entry_matches_search, truncate_html_for_preview};
+use crate::services::clipboard::entry_matches_search;
 use std::collections::HashSet;
 use tauri::{AppHandle, Emitter, State};
 
@@ -79,78 +79,53 @@ pub fn history_page(
     content_type: Option<String>,
     sort_mode: ClipboardSortMode,
 ) -> AppResult<Vec<ClipboardEntry>> {
-    let data_dir = app_data.0.lock().map(|d| d.clone()).unwrap_or_default();
-
-    let limit = limit.clamp(0, 1000);
-    let offset = offset.max(0);
-    if limit == 0 {
+    let data_dir = app_data.0.lock().unwrap().clone();
+    if limit <= 0 {
         return Ok(Vec::new());
     }
-    // With session entries present, merge the sorted prefix before slicing.
-    let session_items = session.0.lock().unwrap();
-    let session_count = session_items.len() as i32;
-    let db_offset = if session_count == 0 { offset } else { 0 };
-    let db_limit = limit.saturating_add(offset - db_offset);
-    let db_items = state.repo.get_history_sorted(
-        db_limit, db_offset, content_type.as_deref(), sort_mode,
-    )?;
     let mut history = {
-        merged_history_page(
-            session_items.iter().filter(|item| {
-                content_type.as_deref().map_or(true, |ct| item.content_type == ct)
-            }),
-            &db_items,
-            (offset - db_offset) as usize,
-            limit as usize,
+        let items = session.0.lock().unwrap();
+        state.repo.history_with_session(
+            items.iter().collect(),
+            limit,
+            offset.max(0),
+            content_type.as_deref(),
             sort_mode,
-        )
+        )?
     };
-    drop(session_items);
-
-    // 5. Truncate content for UI performance and validate media
     for item in &mut history {
-        validate_and_repair_external_media(item, &data_dir);
-
-        if (item.content_type == "text"
-            || item.content_type == "code"
-            || item.content_type == "url"
-            || item.content_type == "rich_text")
-            && item.content.chars().count() > 2000
-        {
-            item.content = format!(
-                "{}... [Truncated for speed]",
-                item.content.chars().take(2000).collect::<String>()
-            );
-        }
-
-        if let Some(ref html) = item.html_content {
-            if html.chars().count() > 5000 {
-                item.html_content = truncate_html_for_preview(html);
-            }
-        }
-
-        if item.content_type == "text"
-            || item.content_type == "code"
-            || item.content_type == "url"
-            || item.content_type == "rich_text"
-        {
-            if item.content.chars().count() > 500 {
-                item.preview = format!("{}...", item.content.chars().take(497).collect::<String>());
-            } else {
-                item.preview = item.content.clone();
-            }
-        }
+        prepare_list_item(item, &data_dir);
     }
-
     Ok(history)
 }
 
+fn prepare_list_item(item: &mut ClipboardEntry, data_dir: &std::path::Path) {
+    validate_and_repair_external_media(item, data_dir);
+    item.html_content = None;
+    item.ocr_text = None;
+    if crate::database::is_text_type(&item.content_type) {
+        if let Some((end, _)) = item.content.char_indices().nth(2000) {
+            item.content.truncate(end);
+            item.content.push_str("... [Truncated for speed]");
+        }
+        if item.preview.is_empty() {
+            item.preview = crate::services::clipboard::build_entry_preview(
+                &item.content_type,
+                &item.content,
+                None,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 fn sorted_page<T: Clone>(items: &mut Vec<&T>, offset: usize, limit: usize,
     compare: impl Fn(&T, &T) -> std::cmp::Ordering) -> Vec<T> {
     items.sort_by(|a, b| compare(a, b));
     items.iter().skip(offset).take(limit).map(|item| (*item).clone()).collect()
 }
 
+#[cfg(test)]
 fn merged_history_page<'a>(
     session_items: impl Iterator<Item = &'a ClipboardEntry>,
     db_items: &'a [ClipboardEntry],
@@ -236,71 +211,57 @@ pub fn search_clipboard_history(
     limit: i32,
     tag_only: Option<bool>,
     note_only: Option<bool>,
+    content_type: Option<String>,
 ) -> AppResult<Vec<ClipboardEntry>> {
-    let is_tag_only = tag_only.unwrap_or(false);
-    let is_note_only = note_only.unwrap_or(false);
-    let data_dir = app_data.0.lock().map(|d| d.clone()).unwrap_or_default();
-    let mut history = state
-        .repo
-        .search(&search_term, limit, is_tag_only, is_note_only)?;
-
-    let session_items = session.inner().0.lock().unwrap();
-    for item in session_items.iter().rev() {
-        if entry_matches_search(item, &search_term, is_tag_only, is_note_only) {
-            if !history.iter().any(|h| h.id == item.id && item.id != 0) {
-                history.push(item.clone());
-            }
-        }
+    let tag_only = tag_only.unwrap_or(false);
+    let note_only = note_only.unwrap_or(false);
+    let limit = limit.max(0);
+    if limit == 0 {
+        return Ok(Vec::new());
     }
+    let data_dir = app_data.0.lock().unwrap().clone();
+    let mut history = state.repo.search_filtered(
+        &search_term,
+        limit,
+        tag_only,
+        note_only,
+        content_type.as_deref(),
+    )?;
 
-    history.sort_by(|a, b| b.sort_at.cmp(&a.sort_at).then_with(|| b.id.cmp(&a.id)));
-    if history.len() > limit as usize {
-        history.truncate(limit as usize);
+    {
+        let items = session.0.lock().unwrap();
+        let needle = search_term.trim().to_lowercase();
+        let mut ids: HashSet<i64> = history.iter().map(|item| item.id).collect();
+        let mut matches: Vec<_> = items
+            .iter()
+            .filter(|item| matches_type(item, content_type.as_deref()))
+            .filter(|item| entry_matches_search(item, &search_term, tag_only, note_only))
+            .collect();
+        matches.sort_by(|a, b| ClipboardSortMode::Recent.compare(a, b));
+        history.extend(
+            matches
+                .into_iter()
+                .filter(|item| item.id == 0 || ids.insert(item.id))
+                .take(limit as usize)
+                .map(|item| {
+                    let mut result = item.clone();
+                    result.ocr_match = item.content_type == "image"
+                        && !needle.is_empty()
+                        && !tag_only
+                        && !note_only
+                        && item
+                            .ocr_text
+                            .as_deref()
+                            .is_some_and(|text| text.to_lowercase().contains(&needle));
+                    result
+                }),
+        );
     }
-
-    let needle = search_term.trim().to_lowercase();
+    history.sort_by(|a, b| ClipboardSortMode::Recent.compare(a, b));
+    history.truncate(limit as usize);
     for item in &mut history {
-        validate_and_repair_external_media(item, &data_dir);
-        if item.content_type == "image" && !needle.is_empty() && !is_tag_only && !is_note_only {
-            // Lists never load the recognized text; fetch it just for image hits.
-            let text = match item.ocr_text.take() {
-                Some(text) => Some(text),
-                None if item.id > 0 => state.repo.get_ocr_text(item.id).ok().flatten(),
-                None => None,
-            };
-            item.ocr_match = text.is_some_and(|text| text.to_lowercase().contains(&needle));
-        }
-        if (item.content_type == "text"
-            || item.content_type == "code"
-            || item.content_type == "url"
-            || item.content_type == "rich_text")
-            && item.content.chars().count() > 2000
-        {
-            item.content = format!(
-                "{}... [Truncated for speed]",
-                item.content.chars().take(2000).collect::<String>()
-            );
-        }
-
-        if let Some(ref html) = item.html_content {
-            if html.chars().count() > 5000 {
-                item.html_content = truncate_html_for_preview(html);
-            }
-        }
-
-        if item.content_type == "text"
-            || item.content_type == "code"
-            || item.content_type == "url"
-            || item.content_type == "rich_text"
-        {
-            if item.content.chars().count() > 500 {
-                item.preview = format!("{}...", item.content.chars().take(497).collect::<String>());
-            } else {
-                item.preview = item.content.clone();
-            }
-        }
+        prepare_list_item(item, &data_dir);
     }
-
     Ok(history)
 }
 
@@ -314,17 +275,12 @@ pub fn delete_clipboard_entry(
     app_data: State<'_, AppDataDir>,
     id: i64,
 ) -> AppResult<()> {
-    {
-        let mut session_items = session.inner().0.lock().unwrap();
-        session_items.retain(|item| item.id != id);
-    }
-    // Session-only images go as soon as their entry does (privacy).
-    crate::services::clipboard::sweep_session_files(&app_handle);
-
     if id > 0 {
-        let data_dir = app_data.0.lock().unwrap();
+        let data_dir = app_data.0.lock().unwrap().clone();
         state.repo.delete(id, Some(&data_dir))?;
     }
+    session.0.lock().unwrap().retain(|item| item.id != id);
+    crate::services::clipboard::sweep_session_files(&app_handle);
     let _ = app_handle.emit("clipboard-changed", ());
     Ok(())
 }
@@ -337,14 +293,13 @@ pub fn clear_clipboard_history(
     session: State<'_, SessionHistory>,
     app_data: State<'_, AppDataDir>,
 ) -> AppResult<()> {
+    let data_dir = app_data.0.lock().unwrap().clone();
+    state.repo.clear(Some(&data_dir))?;
     {
         let mut session_items = session.inner().0.lock().unwrap();
         session_items.retain(|item| item.is_pinned || !item.tags.is_empty());
     }
-    // Session-only images go as soon as their entry does (privacy).
     crate::services::clipboard::sweep_session_files(&app_handle);
-    let data_dir = app_data.0.lock().unwrap();
-    state.repo.clear(Some(&data_dir)).map_err(AppError::from)?;
     let _ = app_handle.emit("clipboard-changed", ());
     Ok(())
 }
@@ -437,7 +392,7 @@ pub fn get_clipboard_content(
     session: State<'_, SessionHistory>,
     id: i64,
 ) -> AppResult<String> {
-    {
+    if id <= 0 {
         let session_items = session.inner().0.lock().unwrap();
         if let Some(item) = session_items.iter().find(|i| i.id == id) {
             return Ok(item.content.clone());

@@ -11,7 +11,7 @@ use base64::Engine;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// Current ciphertext prefix (AES-GCM).
 pub const ENCRYPT_PREFIX: &str = "enc1:";
@@ -36,7 +36,7 @@ const KEY_LEN: usize = 32;
 // Option so a failed load (e.g. user denied Keychain access) is cached and we
 // never re-prompt within the same session.
 static MASTER_KEY: OnceLock<Option<[u8; KEY_LEN]>> = OnceLock::new();
-static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+static DATA_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 pub(crate) fn fill_random(buf: &mut [u8]) -> Option<()> {
     SystemRandom::new().fill(buf).ok()
@@ -78,7 +78,7 @@ pub fn is_modern_ciphertext(value: &str) -> bool {
 /// Keychain at start made an ad-hoc signed build prompt after every rebuild,
 /// for a key nothing needs unless a value is actually encrypted.
 pub fn init(data_dir: &Path) {
-    let _ = DATA_DIR.set(data_dir.to_path_buf());
+    *DATA_DIR.write().unwrap() = Some(data_dir.to_path_buf());
 }
 
 fn get_master_key() -> Option<&'static [u8; KEY_LEN]> {
@@ -94,15 +94,13 @@ fn get_master_key() -> Option<&'static [u8; KEY_LEN]> {
 }
 
 #[allow(dead_code)]
-fn data_dir() -> Option<&'static PathBuf> {
+fn data_dir() -> Option<PathBuf> {
     // Tests share one process and run in any order: one that reaches the key
     // before another calls init() cached "no key" for all of them.
     #[cfg(test)]
-    return Some(DATA_DIR.get_or_init(|| {
-        std::env::temp_dir().join(format!("cp-test-encryption-{}", std::process::id()))
-    }));
+    return Some(std::env::temp_dir().join(format!("cp-test-encryption-{}", std::process::id())));
     #[cfg(not(test))]
-    DATA_DIR.get()
+    DATA_DIR.read().unwrap().clone()
 }
 
 fn load_or_create_master_key() -> Result<[u8; KEY_LEN], String> {
@@ -158,11 +156,18 @@ fn ensure_no_orphaned_ciphertext() -> Result<(), String> {
     if !path.exists() { return Ok(()); }
     let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("cannot verify existing encrypted database: {e}"))?;
-    for (table, fields) in [("settings", vec!["value"]), ("clipboard_history", vec!["content", "preview", "html_content"])] {
+    for (table, fields) in [("settings", vec!["value"]), ("clipboard_history", vec!["content", "preview", "html_content"]), ("favorites", vec!["content", "preview", "html_content"])] {
         let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |r| r.get(0)).map_err(|e| e.to_string())?;
         if !exists { continue; }
         for field in fields {
-            let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {field} LIKE 'enc1:%')");
+            let protected = if table == "favorites" { " AND is_encrypted = 1" } else { "" };
+            if table == "favorites" && !conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('favorites') WHERE name = 'is_encrypted')",
+                [], |row| row.get::<_, bool>(0),
+            ).map_err(|e| e.to_string())? {
+                break;
+            }
+            let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {field} GLOB 'enc1:*'{protected})");
             if conn.query_row(&sql, [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())? {
                 return Err("existing encrypted data has no accessible master key; restore the original key before saving".into());
             }
@@ -354,151 +359,92 @@ fn decrypt_modern_value_once(cipher: &str) -> Option<String> {
     String::from_utf8(plain).ok()
 }
 
-/// Re-encrypt legacy `plain:` / Windows `dpapi:` blobs when they can be
-/// decrypted. Undecryptable ciphertext is intentionally left untouched.
+/// Upgrade legacy values atomically, keeping a backup only if rows change.
 pub fn migrate_legacy_ciphertexts(conn: &rusqlite::Connection) -> Result<usize, String> {
     if cfg!(feature = "portable") {
         return Ok(0);
     }
-    backup_before_migration(conn)?;
-    let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    let upgraded = migrate_legacy_in_transaction(&transaction)?;
-    transaction.commit().map_err(|e| e.to_string())?;
-    Ok(upgraded)
+    migrate_legacy_inner(conn).map_err(|e| e.to_string())
 }
 
-// VACUUM INTO takes a consistent SQLite snapshot, including committed WAL data.
-// It must run outside the migration transaction. Never overwrite an old backup.
-fn backup_before_migration(conn: &rusqlite::Connection) -> Result<(), String> {
-    let path: String = conn.query_row("SELECT file FROM pragma_database_list WHERE name = 'main'", [], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-    if path.is_empty() { return Ok(()); } // In-memory tests have no durable data.
-    let backup = format!("{path}.pre-encryption-v1.bak");
-    if std::path::Path::new(&backup).exists() { return Ok(()); }
-    conn.execute("VACUUM main INTO ?1", [&backup]).map_err(|e| format!("encryption backup failed: {e}"))?;
+fn migrate_legacy_inner(conn: &rusqlite::Connection) -> Result<usize, Box<dyn std::error::Error>> {
+    const MIGRATION: &str = "legacy-encryption-v1";
+    if conn.query_row("SELECT EXISTS(SELECT 1 FROM fork_migrations WHERE name = ?)", [MIGRATION], |row| row.get::<_, bool>(0))? {
+        return Ok(0);
+    }
+    let settings = {
+        let mut stmt = conn.prepare("SELECT key, value FROM settings WHERE value NOT GLOB 'enc1:*'")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut pending = Vec::new();
+        for row in rows {
+            let (key, value) = row?;
+            if crate::database::is_sensitive_key(&key) {
+                pending.push((key, encrypt_for_storage(&decrypt_stored_value(&value)?)?));
+            }
+        }
+        pending
+    };
+    let history = {
+        let mut stmt = conn.prepare(
+            "SELECT id, content, preview, html_content FROM clipboard_history
+             WHERE content GLOB 'plain:*' OR preview GLOB 'plain:*' OR html_content GLOB 'plain:*'
+                OR content GLOB 'dpapi:*' OR preview GLOB 'dpapi:*' OR html_content GLOB 'dpapi:*'",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let html: Option<String> = row.get(3)?;
+            pending.push((id, upgrade_field(row.get(1)?)?, upgrade_field(row.get(2)?)?, html.map(upgrade_field).transpose()?));
+        }
+        pending
+    };
+    if !settings.is_empty() || !history.is_empty() {
+        backup_before_migration(conn)?;
+    }
+    let tx = conn.unchecked_transaction()?;
+    for (key, value) in &settings {
+        tx.execute("UPDATE settings SET value = ?1 WHERE key = ?2", rusqlite::params![value, key])?;
+    }
+    for (id, content, preview, html) in &history {
+        tx.execute("UPDATE clipboard_history SET content = ?1, preview = ?2, html_content = ?3 WHERE id = ?4",
+            rusqlite::params![content, preview, html, id])?;
+    }
+    tx.execute("INSERT INTO fork_migrations (name) VALUES (?)", [MIGRATION])?;
+    tx.commit()?;
+    Ok(settings.len() + history.len())
+}
+
+fn backup_before_migration(conn: &rusqlite::Connection) -> Result<(), Box<dyn std::error::Error>> {
+    let path: String = conn.query_row("SELECT file FROM pragma_database_list WHERE name = 'main'", [], |row| row.get(0))?;
+    let backup = PathBuf::from(format!("{path}.pre-encryption-v1.bak"));
+    if path.is_empty() || backup.try_exists()? {
+        return Ok(());
+    }
+    let temporary = backup.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("cannot restrict backup permissions: {e}"))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    Ok(())
+    drop(options.open(&temporary)?);
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        conn.backup(rusqlite::DatabaseName::Main, &temporary, None)?;
+        std::fs::File::open(&temporary)?.sync_all()?;
+        std::fs::hard_link(&temporary, backup)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
 }
 
-fn migrate_legacy_in_transaction(conn: &rusqlite::Connection) -> Result<usize, String> {
-    let mut upgraded = 0usize;
-
-    // Settings: sensitive keys with legacy or plaintext values are rewritten via encrypt.
-    {
-        let mut stmt = conn
-            .prepare("SELECT key, value FROM settings")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?;
-
-        let mut updates: Vec<(String, String)> = Vec::new();
-        for row in rows {
-            let (key, value) = row.map_err(|e| e.to_string())?;
-            if !crate::database::is_sensitive_key(&key) {
-                continue;
-            }
-            let upgraded_value = upgrade_field(&value);
-            if upgraded_value != value {
-                updates.push((key, upgraded_value));
-                continue;
-            }
-            if is_modern_ciphertext(&value) {
-                continue;
-            }
-            let plain = if is_encrypted_value(&value) {
-                let Some(plain) = decrypt_value(&value) else {
-                    continue;
-                };
-                plain
-            } else {
-                value
-            };
-            if let Some(enc) = encrypt_value(&plain) {
-                updates.push((key, enc));
-            }
-        }
-        for (key, enc) in updates {
-            conn.execute(
-                "UPDATE settings SET value = ?1 WHERE key = ?2",
-                rusqlite::params![enc, key],
-            )
-            .map_err(|e| e.to_string())?;
-            upgraded += 1;
-        }
-    }
-
-    // Clipboard text fields with legacy plain: prefix
-    {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, content, preview, html_content FROM clipboard_history
-                 WHERE content LIKE 'plain:%'
-                    OR preview LIKE 'plain:%'
-                    OR html_content LIKE 'plain:%'
-                    OR content LIKE 'dpapi:%'
-                    OR preview LIKE 'dpapi:%'
-                    OR html_content LIKE 'dpapi:%'
-                    OR content LIKE 'enc1:%'
-                    OR preview LIKE 'enc1:%'
-                    OR html_content LIKE 'enc1:%'",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-
-        let mut updates: Vec<(i64, String, String, Option<String>)> = Vec::new();
-        for row in rows {
-            let (id, content, preview, html) = row.map_err(|e| e.to_string())?;
-            let new_content = upgrade_field(&content);
-            let new_preview = upgrade_field(&preview);
-            let new_html = html.as_ref().map(|h| upgrade_field(h));
-            if new_content != content
-                || new_preview != preview
-                || new_html.as_ref() != html.as_ref()
-            {
-                updates.push((id, new_content, new_preview, new_html));
-            }
-        }
-        for (id, content, preview, html) in updates {
-            conn.execute(
-                "UPDATE clipboard_history SET content = ?1, preview = ?2, html_content = ?3 WHERE id = ?4",
-                rusqlite::params![content, preview, html, id],
-            )
-            .map_err(|e| e.to_string())?;
-            upgraded += 1;
-        }
-    }
-
-    Ok(upgraded)
-}
-
-fn upgrade_field(value: &str) -> String {
-    if is_modern_ciphertext(value) {
-        return value.to_string();
-    }
+fn upgrade_field(value: String) -> Result<String, String> {
     if value.starts_with(LEGACY_PLAIN_PREFIX) || value.starts_with(LEGACY_DPAPI_PREFIX) {
-        let Some(plain) = decrypt_value(value) else {
-            return value.to_string();
-        };
-        return encrypt_value(&plain).unwrap_or_else(|| value.to_string());
+        return encrypt_for_storage(&decrypt_stored_value(&value)?);
     }
-    value.to_string()
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -548,29 +494,53 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "portable"))]
+    fn legacy_migration_backs_up_only_if_values_need_upgrading() {
+        let root = std::env::temp_dir().join(format!("copypaste-encryption-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let db = root.join("clipboard.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        crate::infrastructure::repository::migrations::run_migrations(&conn).unwrap();
+        assert_eq!(migrate_legacy_ciphertexts(&conn).unwrap(), 0);
+        assert!(!root.join("clipboard.db.pre-encryption-v1.bak").exists());
+
+        conn.execute("DELETE FROM fork_migrations", []).unwrap();
+        conn.execute("INSERT INTO settings VALUES ('mqtt_password', 'plain:secret')", []).unwrap();
+        assert_eq!(migrate_legacy_ciphertexts(&conn).unwrap(), 1);
+        assert_eq!(migrate_legacy_ciphertexts(&conn).unwrap(), 0);
+        let backup = rusqlite::Connection::open(root.join("clipboard.db.pre-encryption-v1.bak")).unwrap();
+        let value = |conn: &rusqlite::Connection| {
+            conn.query_row("SELECT value FROM settings WHERE key = 'mqtt_password'", [], |row| row.get::<_, String>(0)).unwrap()
+        };
+        assert_eq!(value(&backup), "plain:secret");
+        let cipher = value(&conn);
+        assert!(is_modern_ciphertext(&cipher));
+        assert_eq!(decrypt_stored_value(&cipher).unwrap(), "secret");
+        drop(backup);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
     fn migration_preserves_undecryptable_dpapi_values() {
         let conn = rusqlite::Connection::open_in_memory().expect("open database");
+        crate::infrastructure::repository::migrations::run_migrations(&conn).unwrap();
         conn.execute_batch(
-            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE clipboard_history (
-                 id INTEGER PRIMARY KEY,
-                 content TEXT NOT NULL,
-                 preview TEXT NOT NULL,
-                 html_content TEXT
-             );
-             INSERT INTO settings (key, value)
+             "INSERT INTO settings (key, value)
              VALUES ('mqtt_password', 'dpapi:not-valid-base64');
-             INSERT INTO clipboard_history (id, content, preview, html_content)
+             INSERT INTO clipboard_history (id, content, preview, html_content, content_type, timestamp, source_app)
              VALUES (
                  1,
                  'dpapi:not-valid-base64',
                  'dpapi:not-valid-base64',
-                 'dpapi:not-valid-base64'
+                 'dpapi:not-valid-base64', 'text', 1, 'Notes'
              );",
         )
         .expect("create legacy rows");
 
-        assert_eq!(migrate_legacy_ciphertexts(&conn).expect("migrate"), 0);
+        assert!(migrate_legacy_ciphertexts(&conn).is_err());
+        assert_eq!(conn.query_row("SELECT count(*) FROM fork_migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         let setting: String = conn
             .query_row(
                 "SELECT value FROM settings WHERE key = 'mqtt_password'",

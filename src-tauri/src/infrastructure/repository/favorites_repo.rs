@@ -2,6 +2,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Result, Row};
 use serde::Serialize;
+use crate::infrastructure::encryption;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Favorite {
@@ -15,6 +16,8 @@ pub struct Favorite {
     pub source_app: String,
     pub sort_order: i64,
     pub created_at: i64,
+    #[serde(skip)]
+    pub is_encrypted: bool,
 }
 
 pub struct NewFavorite<'a> {
@@ -25,10 +28,14 @@ pub struct NewFavorite<'a> {
     pub source_app: &'a str,
 }
 
-const COLUMNS: &str = "id, content_type, content, html_content, preview, source_app, sort_order, created_at";
+const COLUMNS: &str = "id, content_type, content, html_content, preview, source_app, sort_order, created_at, is_encrypted";
+
+fn crypto_error(error: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
+}
 
 fn from_row(row: &Row<'_>) -> Result<Favorite> {
-    Ok(Favorite {
+    let mut favorite = Favorite {
         id: row.get(0)?,
         content_type: row.get(1)?,
         content: row.get(2)?,
@@ -37,7 +44,15 @@ fn from_row(row: &Row<'_>) -> Result<Favorite> {
         source_app: row.get(5)?,
         sort_order: row.get(6)?,
         created_at: row.get(7)?,
-    })
+        is_encrypted: row.get(8)?,
+    };
+    if favorite.is_encrypted {
+        let decode = |value: &str| encryption::decrypt_stored_value(value).map_err(crypto_error);
+        favorite.content = decode(&favorite.content)?;
+        favorite.preview = decode(&favorite.preview)?;
+        favorite.html_content = favorite.html_content.as_deref().map(decode).transpose()?;
+    }
+    Ok(favorite)
 }
 
 pub fn list(conn: &Connection) -> Result<Vec<Favorite>> {
@@ -54,30 +69,172 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Favorite>> {
 
 /// Text already kept: adding it again keeps the one entry.
 pub fn find_text(conn: &Connection, content_type: &str, content: &str) -> Result<Option<Favorite>> {
-    let sql = format!("SELECT {COLUMNS} FROM favorites WHERE content_type = ?1 AND content = ?2");
-    conn.query_row(&sql, params![content_type, content], from_row).optional()
+    let sql = format!(
+        "SELECT {COLUMNS} FROM favorites WHERE content_type = ?1
+        AND (content = ?2 OR is_encrypted = 1) ORDER BY is_encrypted DESC, id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![content_type, content], from_row)?;
+    for favorite in rows {
+        let favorite = favorite?;
+        if favorite.content == content {
+            return Ok(Some(favorite));
+        }
+    }
+    Ok(None)
 }
 
 /// New favorites go to the end of the list.
 pub fn insert(conn: &Connection, new: &NewFavorite<'_>, now: i64) -> Result<Favorite> {
+    insert_with_protection(conn, new, now, false)
+}
+
+fn storage_value(value: &str, protected: bool) -> Result<String> {
+    if protected {
+        return encryption::encrypt_value(value)
+            .ok_or_else(|| crypto_error("favorite encryption unavailable".into()));
+    }
+    Ok(value.into())
+}
+
+pub fn insert_with_protection(
+    conn: &Connection,
+    new: &NewFavorite<'_>,
+    now: i64,
+    protected: bool,
+) -> Result<Favorite> {
+    let encode = |value: &str| storage_value(value, protected);
+    let content = encode(new.content)?;
+    let preview = encode(new.preview)?;
+    let html = new.html_content.map(encode).transpose()?;
     let order: i64 = conn.query_row(
         "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM favorites",
         [],
         |row| row.get(0),
     )?;
     conn.execute(
-        "INSERT INTO favorites (content_type, content, html_content, preview, source_app, sort_order, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-        params![new.content_type, new.content, new.html_content, new.preview, new.source_app, order, now],
+        "INSERT INTO favorites (content_type, content, html_content, preview, source_app, sort_order, created_at, updated_at, is_encrypted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+        params![new.content_type, content, html, preview, new.source_app, order, now, protected],
     )?;
     Ok(get(conn, conn.last_insert_rowid())?.expect("just inserted"))
 }
 
+pub fn protect(conn: &Connection, favorite: &mut Favorite) -> Result<()> {
+    if !favorite.is_encrypted {
+        let html = favorite
+            .html_content
+            .as_deref()
+            .map(|value| storage_value(value, true))
+            .transpose()?;
+        conn.execute(
+            "UPDATE favorites SET content = ?1, preview = ?2, html_content = ?3, is_encrypted = 1 WHERE id = ?4",
+            params![storage_value(&favorite.content, true)?, storage_value(&favorite.preview, true)?, html, favorite.id],
+        )?;
+        favorite.is_encrypted = true;
+    }
+    Ok(())
+}
+
+const PROTECTED_SOURCE: &str =
+    "(content GLOB 'enc1:*' OR preview GLOB 'enc1:*' OR html_content GLOB 'enc1:*'
+      OR content GLOB 'plain:*' OR preview GLOB 'plain:*' OR html_content GLOB 'plain:*'
+      OR content GLOB 'dpapi:*' OR preview GLOB 'dpapi:*' OR html_content GLOB 'dpapi:*'
+      OR EXISTS(SELECT 1 FROM entry_tags WHERE entry_id = ch.id
+                AND tag COLLATE NOCASE IN ('sensitive', '密码', 'password')))";
+
+pub fn is_sensitive_source(conn: &Connection, id: i64) -> Result<bool> {
+    conn.query_row(
+        &format!("SELECT COALESCE({PROTECTED_SOURCE}, 0) FROM clipboard_history ch WHERE id = ?1"),
+        [id],
+        |row| row.get(0),
+    )
+}
+
+/// Old favorites stored no source ID. Repair rows whose original source
+/// fields match a still-present sensitive entry, including the full format.
+pub(crate) fn repair_sensitive_favorites(conn: &Connection) -> Result<()> {
+    if cfg!(feature = "portable") {
+        return Ok(());
+    }
+    const MIGRATION: &str = "sensitive-favorites-v1";
+    let tx = conn.unchecked_transaction()?;
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM fork_migrations WHERE name = ?)",
+        [MIGRATION],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
+    let favorites = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT {COLUMNS} FROM favorites WHERE is_encrypted = 0
+             AND content_type IN ('text', 'rich_text', 'code', 'url')"
+        ))?;
+        let rows = stmt.query_map([], from_row)?;
+        rows.collect::<Result<Vec<_>>>()?
+    };
+    for mut favorite in favorites {
+        let protected = {
+            let sql = format!(
+                "SELECT content, preview, html_content FROM clipboard_history ch
+                 WHERE content_type = ?1 AND source_app = ?2 AND created_at <= ?3 AND {PROTECTED_SOURCE}"
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let mut rows = stmt.query(params![
+                favorite.content_type,
+                favorite.source_app,
+                favorite.created_at
+            ])?;
+            let mut matched = false;
+            while let Some(row) = rows.next()? {
+                let decode =
+                    |value: &str| encryption::decrypt_stored_value(value).map_err(crypto_error);
+                let content: String = row.get(0)?;
+                if decode(&content)? != favorite.content {
+                    continue;
+                }
+                let preview: String = row.get(1)?;
+                let html: Option<String> = row.get(2)?;
+                if decode(&preview)? == favorite.preview
+                    && html.as_deref().map(decode).transpose()? == favorite.html_content
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            matched
+        };
+        if protected {
+            protect(&tx, &mut favorite)?;
+        }
+    }
+    tx.execute("INSERT INTO fork_migrations (name) VALUES (?)", [MIGRATION])?;
+    tx.commit()
+}
+
 /// Editing makes it plain text, like editing a history entry.
-pub fn update_text(conn: &Connection, id: i64, content_type: &str, content: &str, preview: &str, now: i64) -> Result<()> {
+pub fn update_text(
+    conn: &Connection,
+    id: i64,
+    content_type: &str,
+    content: &str,
+    preview: &str,
+    now: i64,
+) -> Result<()> {
+    let Some(protected) = conn
+        .query_row(
+            "SELECT is_encrypted FROM favorites WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
     conn.execute(
         "UPDATE favorites SET content_type = ?1, content = ?2, html_content = NULL, preview = ?3, updated_at = ?4 WHERE id = ?5",
-        params![content_type, content, preview, now, id],
+        params![content_type, storage_value(content, protected)?, storage_value(preview, protected)?, now, id],
     )?;
     Ok(())
 }
@@ -143,5 +300,46 @@ mod tests {
         assert_eq!(edited.content, "b");
         assert_eq!(edited.content_type, "text");
         assert!(edited.html_content.is_none());
+    }
+
+    #[cfg(not(feature = "portable"))]
+    #[test]
+    fn sensitive_favorites_stay_encrypted_when_read_deduplicated_and_edited() {
+        let conn = db();
+        let rich = NewFavorite {
+            content_type: "rich_text", content: "secret", html_content: Some("<b>secret</b>"),
+            preview: "secret preview", source_app: "Notes",
+        };
+        let saved = insert_with_protection(&conn, &rich, 20, true).unwrap();
+        let raw = |column: &str| conn.query_row(
+            &format!("SELECT {column} FROM favorites WHERE id = ?"), [saved.id], |row| row.get::<_, String>(0),
+        ).unwrap();
+        for (column, value) in [("content", "secret"), ("preview", "secret preview"), ("html_content", "<b>secret</b>")] {
+            let cipher = raw(column);
+            assert!(encryption::is_modern_ciphertext(&cipher));
+            assert_eq!(encryption::decrypt_stored_value(&cipher).unwrap(), value);
+        }
+        assert_eq!(find_text(&conn, "rich_text", "secret").unwrap().unwrap().id, saved.id);
+        update_text(&conn, saved.id, "text", "new secret", "new preview", 21).unwrap();
+        assert!(encryption::is_modern_ciphertext(&raw("content")));
+        assert_eq!(get(&conn, saved.id).unwrap().unwrap().content, "new secret");
+    }
+
+    #[cfg(not(feature = "portable"))]
+    #[test]
+    fn repair_encrypts_only_favorites_with_matching_sensitive_sources() {
+        let conn = db();
+        conn.execute_batch(
+            "INSERT INTO clipboard_history
+                (id, content_type, content, source_app, timestamp, created_at, preview)
+             VALUES (1, 'text', 'secret', 'Notes', 10, 10, 'secret');
+             INSERT INTO entry_tags (entry_id, tag) VALUES (1, 'sensitive');",
+        ).unwrap();
+        let saved = insert(&conn, &NewFavorite { source_app: "Notes", ..text("secret") }, 20).unwrap();
+        let manual = insert(&conn, &text("secret"), 20).unwrap();
+        repair_sensitive_favorites(&conn).unwrap();
+        repair_sensitive_favorites(&conn).unwrap();
+        assert!(get(&conn, saved.id).unwrap().unwrap().is_encrypted);
+        assert!(!get(&conn, manual.id).unwrap().unwrap().is_encrypted);
     }
 }

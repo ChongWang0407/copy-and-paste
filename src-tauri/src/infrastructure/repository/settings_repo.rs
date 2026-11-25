@@ -25,6 +25,13 @@ impl SqliteSettingsRepository {
         Self { conn }
     }
 
+    pub fn app_settings(&self) -> Result<HashMap<String, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT key, value FROM settings WHERE key GLOB 'app.*'")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
     pub fn get_raw(conn: &Connection, key: &str) -> Result<Option<String>> {
         let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?")?;
         let mut rows = stmt.query(params![key])?;
