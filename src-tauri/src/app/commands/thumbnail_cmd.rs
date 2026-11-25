@@ -3,10 +3,12 @@ use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::UNIX_EPOCH;
 use tauri::{AppHandle, Manager};
 
@@ -37,6 +39,26 @@ pub(crate) fn thumbnail_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
         .map_err(|e| AppError::IO(format!("cache dir unavailable: {}", e)))?
         .join("thumbnails");
     Ok(THUMBNAIL_DIR.get_or_init(|| dir).clone())
+}
+
+fn session_thumbnail_dir(data_dir: &Path, path: &Path) -> Option<PathBuf> {
+    let session = data_dir.join("session");
+    let attachments = session.join("attachments");
+    let in_session = path.starts_with(&attachments)
+        || fs::canonicalize(path)
+            .ok()
+            .zip(fs::canonicalize(&attachments).ok())
+            .is_some_and(|(path, root)| path.starts_with(root));
+    in_session.then(|| session.join("thumbnails"))
+}
+
+pub(crate) fn thumbnail_dir_for_path(app: &AppHandle, path: &str) -> Result<PathBuf, AppError> {
+    if let Some(dir) = crate::services::content_handler::app_data_dir(app)
+        .and_then(|dir| session_thumbnail_dir(&dir, Path::new(path)))
+    {
+        return Ok(dir);
+    }
+    thumbnail_dir(app)
 }
 
 /// At startup: remember where thumbnails live (so deletes can remove them) and
@@ -82,9 +104,6 @@ fn prune_thumbnail_cache(dir: &Path) {
 /// Remove the cached thumbnails of an image that is about to be deleted, so a
 /// deleted (possibly sensitive) screenshot doesn't live on as a thumbnail.
 pub fn remove_cached_thumbnails(path: &Path) {
-    let Some(dir) = THUMBNAIL_DIR.get() else {
-        return;
-    };
     let Ok(canonical) = fs::canonicalize(path) else {
         return;
     };
@@ -98,19 +117,44 @@ pub fn remove_cached_thumbnails(path: &Path) {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let key = thumbnail_cache_key(&canonical, meta.len(), mtime_nanos);
-    for ext in ["jpg", "png"] {
-        let _ = fs::remove_file(dir.join(format!("{}.{}", key, ext)));
+    let session_cache = path
+        .parent()
+        .and_then(Path::parent)
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "session"))
+        .map(|dir| dir.join("thumbnails"));
+    for dir in THUMBNAIL_DIR
+        .get()
+        .into_iter()
+        .chain(session_cache.as_ref())
+    {
+        for ext in ["jpg", "png"] {
+            let _ = fs::remove_file(dir.join(format!("{key}.{ext}")));
+        }
     }
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Returns an absolute path to a thumbnail (longest side <= 320 px) for `path`.
+fn thumbnail_generation(cache_dir: &Path, key: &str) -> Arc<Mutex<()>> {
+    static GENERATIONS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut generations = GENERATIONS.lock().unwrap();
+    let key = cache_dir.join(key);
+    if let Some(lock) = generations.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    generations.retain(|_, lock| lock.strong_count() != 0);
+    let lock = Arc::new(Mutex::new(()));
+    generations.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+/// Returns an absolute path to a thumbnail (longest side <= 800 px) for `path`.
 /// Images that already fit return `path` unchanged; larger animated ones get a
 /// still thumbnail of their first frame.
 #[tauri::command]
 pub async fn get_image_thumbnail(app: AppHandle, path: String) -> Result<String, AppError> {
-    let cache_dir = thumbnail_dir(&app)?;
+    let cache_dir = thumbnail_dir_for_path(&app, &path)?;
     tauri::async_runtime::spawn_blocking(move || build_thumbnail(&path, &cache_dir))
         .await
         .map_err(|e| AppError::Internal(format!("thumbnail task failed: {}", e)))?
@@ -122,7 +166,7 @@ pub async fn get_image_thumbnail(app: AppHandle, path: String) -> Result<String,
 /// preview; the WebView decodes only a few codecs (no MKV, AVI, often HEVC).
 #[tauri::command]
 pub async fn get_video_thumbnail(app: AppHandle, path: String) -> Result<String, AppError> {
-    let cache_dir = thumbnail_dir(&app)?;
+    let cache_dir = thumbnail_dir_for_path(&app, &path)?;
     tauri::async_runtime::spawn_blocking(move || build_video_thumbnail(&path, &cache_dir))
         .await
         .map_err(|e| AppError::Internal(format!("video thumbnail task failed: {}", e)))?
@@ -143,6 +187,8 @@ fn build_video_thumbnail(path: &str, cache_dir: &Path) -> Result<String, AppErro
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let key = format!("video-{}", thumbnail_cache_key(&canonical, meta.len(), mtime_nanos));
+    let generation = thumbnail_generation(cache_dir, &key);
+    let _generation = generation.lock().unwrap();
     let final_path = cache_dir.join(format!("{}.jpg", key));
     if final_path.is_file() {
         return Ok(final_path.to_string_lossy().into_owned());
@@ -187,7 +233,7 @@ fn system_video_frame(path: &Path, cache_dir: &Path, key: &str) -> Result<Dynami
     let result = (|| {
         let mut child = Command::new("/usr/bin/qlmanage")
             .arg("-t")
-            .args(["-s", &(THUMBNAIL_MAX_SIDE * 2).to_string()])
+            .args(["-s", &VIDEO_THUMBNAIL_MAX_SIDE.to_string()])
             .arg("-o")
             .arg(&out_dir)
             .arg(path)
@@ -265,6 +311,8 @@ pub(crate) fn build_thumbnail(path: &str, cache_dir: &Path) -> Result<String, Ap
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let key = thumbnail_cache_key(&canonical, meta.len(), mtime_nanos);
+    let generation = thumbnail_generation(cache_dir, &key);
+    let _generation = generation.lock().unwrap();
 
     // Cache hit: reuse without decoding anything.
     for ext in ["jpg", "png"] {
@@ -274,35 +322,38 @@ pub(crate) fn build_thumbnail(path: &str, cache_dir: &Path) -> Result<String, Ap
         }
     }
 
-    let (width, height) = open_reader(&canonical)?
-        .into_dimensions()
-        .map_err(|_| decode_error())?;
-    let Some((target_w, target_h)) = fit_within(width, height, THUMBNAIL_MAX_SIDE) else {
-        return Ok(path.to_string());
-    };
-    // Large animated GIF/WebP get a still thumbnail of their first frame (the
-    // decoder below reads only that one): the list plays them on hover only.
-    // Every visible row decoding every frame at full size kept the CPU/GPU busy.
-
     let mut decoder = open_reader(&canonical)?
         .into_decoder()
         .map_err(|_| decode_error())?;
-    let orientation = decoder.orientation().ok();
-    let mut img = DynamicImage::from_decoder(decoder).map_err(|_| decode_error())?;
-    if let Some(orientation) = orientation {
-        img.apply_orientation(orientation);
+    let (width, height) = decoder.dimensions();
+    if fit_within(width, height, THUMBNAIL_MAX_SIDE).is_none() {
+        return Ok(path.to_string());
     }
-    // Orientation may swap width/height; recompute from the oriented image.
-    let (target_w, target_h) =
-        fit_within(img.width(), img.height(), THUMBNAIL_MAX_SIDE).unwrap_or((target_w, target_h));
-    // Once per image, off the main thread. thumbnail_exact is faster, but its
-    // box sampling turns the small text of a screenshot to mush.
-    let thumb = img.resize_exact(target_w, target_h, FilterType::Lanczos3);
+    #[cfg(target_os = "macos")]
+    let native = native_thumbnail::decode(&canonical, THUMBNAIL_MAX_SIDE);
+    #[cfg(not(target_os = "macos"))]
+    let native: Option<DynamicImage> = None;
+    let thumb = if let Some(native) = native {
+        native
+    } else {
+        // Keep support for formats the Rust decoder can read on its own.
+        let orientation = decoder.orientation().ok();
+        let mut image = DynamicImage::from_decoder(decoder).map_err(|_| decode_error())?;
+        if let Some(orientation) = orientation {
+            image.apply_orientation(orientation);
+        }
+        if let Some((width, height)) = fit_within(image.width(), image.height(), THUMBNAIL_MAX_SIDE)
+        {
+            image.resize_exact(width, height, FilterType::Lanczos3)
+        } else {
+            image
+        }
+    };
 
-    let keep_alpha = thumb.color().has_alpha() && thumb.to_rgba8().pixels().any(|p| p.0[3] < 255);
-    let (ext, bytes) = if keep_alpha {
+    let rgba = thumb.color().has_alpha().then(|| thumb.to_rgba8());
+    let (ext, bytes) = if let Some(rgba) = rgba.filter(|rgba| rgba.pixels().any(|p| p.0[3] < 255)) {
         let mut out = Vec::new();
-        DynamicImage::ImageRgba8(thumb.to_rgba8())
+        DynamicImage::ImageRgba8(rgba)
             .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)
             .map_err(|e| AppError::Internal(format!("thumbnail encode failed: {}", e)))?;
         ("png", out)
@@ -331,6 +382,105 @@ fn decode_error() -> AppError {
     AppError::Internal("failed to decode image".to_string())
 }
 
+#[cfg(target_os = "macos")]
+mod native_thumbnail {
+    use std::ffi::c_void;
+    use std::path::Path;
+    use std::ptr::{null, NonNull};
+
+    use image::DynamicImage;
+    use objc2::rc::{autoreleasepool, Retained};
+    use objc2_foundation::{NSDictionary, NSMutableData, NSNumber, NSString, NSURL};
+
+    type Ref = *const c_void;
+
+    #[link(name = "ImageIO", kind = "framework")]
+    extern "C" {
+        static kCGImageSourceCreateThumbnailFromImageAlways: Ref;
+        static kCGImageSourceCreateThumbnailWithTransform: Ref;
+        static kCGImageSourceThumbnailMaxPixelSize: Ref;
+        fn CGImageSourceCreateWithURL(url: Ref, options: Ref) -> *mut c_void;
+        fn CGImageSourceCreateThumbnailAtIndex(
+            source: Ref,
+            index: usize,
+            options: Ref,
+        ) -> *mut c_void;
+        fn CGImageDestinationCreateWithData(
+            data: Ref,
+            format: Ref,
+            count: usize,
+            options: Ref,
+        ) -> *mut c_void;
+        fn CGImageDestinationAddImage(destination: Ref, image: Ref, options: Ref);
+        fn CGImageDestinationFinalize(destination: Ref) -> u8;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(object: Ref);
+    }
+
+    struct Owned(NonNull<c_void>);
+
+    impl Owned {
+        fn new(ptr: *mut c_void) -> Option<Self> {
+            NonNull::new(ptr).map(Self)
+        }
+
+        fn as_ref(&self) -> Ref {
+            self.0.as_ptr()
+        }
+    }
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            // ImageIO create functions return a retained Core Foundation object.
+            unsafe { CFRelease(self.as_ref()) };
+        }
+    }
+
+    pub(super) fn decode(path: &Path, max_side: u32) -> Option<DynamicImage> {
+        autoreleasepool(|_| {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str()?));
+            let yes = NSNumber::new_bool(true);
+            let pixels = NSNumber::new_u32(max_side);
+            let data = NSMutableData::new();
+            let png = NSString::from_str("public.png");
+            // NSURL, NSDictionary, NSString and NSMutableData bridge to the
+            // corresponding Core Foundation types. All outlive the calls.
+            unsafe {
+                let options = NSDictionary::<NSString, NSNumber>::from_slices(
+                    &[
+                        &*kCGImageSourceCreateThumbnailFromImageAlways.cast::<NSString>(),
+                        &*kCGImageSourceCreateThumbnailWithTransform.cast::<NSString>(),
+                        &*kCGImageSourceThumbnailMaxPixelSize.cast::<NSString>(),
+                    ],
+                    &[&*yes, &*yes, &*pixels],
+                );
+                let source = Owned::new(CGImageSourceCreateWithURL(
+                    Retained::as_ptr(&url).cast(),
+                    null(),
+                ))?;
+                let image = Owned::new(CGImageSourceCreateThumbnailAtIndex(
+                    source.as_ref(),
+                    0,
+                    Retained::as_ptr(&options).cast(),
+                ))?;
+                let destination = Owned::new(CGImageDestinationCreateWithData(
+                    Retained::as_ptr(&data).cast(),
+                    Retained::as_ptr(&png).cast(),
+                    1,
+                    null(),
+                ))?;
+                CGImageDestinationAddImage(destination.as_ref(), image.as_ref(), null());
+                if CGImageDestinationFinalize(destination.as_ref()) == 0 {
+                    return None;
+                }
+            }
+            image::load_from_memory_with_format(&data.to_vec(), image::ImageFormat::Png).ok()
+        })
+    }
+}
 
 /// Write via a temp file + rename so concurrent callers never see a partial file.
 fn write_atomically(final_path: &PathBuf, bytes: &[u8]) -> Result<(), AppError> {
@@ -435,5 +585,31 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn imageio_decodes_to_the_requested_size() {
+        let path = std::env::temp_dir().join(format!("cp-imageio-{}.png", uuid::Uuid::new_v4()));
+        image::RgbaImage::from_pixel(2400, 1200, image::Rgba([50, 100, 150, 128]))
+            .save(&path)
+            .unwrap();
+        let thumbnail = native_thumbnail::decode(&path, 320).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!((thumbnail.width(), thumbnail.height()), (320, 160));
+        assert_eq!(thumbnail.to_rgba8().get_pixel(0, 0).0[3], 128);
+    }
+
+    #[test]
+    fn session_thumbnail_cache_lives_with_its_attachments() {
+        let root = std::env::temp_dir().join(format!("cp-session-thumb-{}", uuid::Uuid::new_v4()));
+        let attachment = root.join("session/attachments/shot.png");
+        fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+        image::RgbImage::new(900, 450).save(&attachment).unwrap();
+        let cache = session_thumbnail_dir(&root, &attachment).unwrap();
+        let thumbnail = build_thumbnail(attachment.to_str().unwrap(), &cache).unwrap();
+        assert!(Path::new(&thumbnail).starts_with(root.join("session/thumbnails")));
+        remove_cached_thumbnails(&attachment);
+        assert!(!Path::new(&thumbnail).exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

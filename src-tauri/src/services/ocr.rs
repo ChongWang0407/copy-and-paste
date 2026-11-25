@@ -20,8 +20,10 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::app_state::{AppDataDir, SessionHistory};
 use crate::database::DbState;
+use crate::domain::models::{ClipboardEntry, EntryVersion};
 use crate::error::{AppError, AppResult};
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+use crate::services::content_handler::FileVersion;
 
 /// Larger files aren't screenshots of text, and tie up the worker.
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
@@ -63,40 +65,64 @@ pub fn recognize_text(bytes: &[u8]) -> Result<String, String> {
     })
 }
 
-fn image_bytes(content: &str, data_dir: &Path) -> Option<Vec<u8>> {
-    if let Some(encoded) = content
+fn image_bytes(
+    content: &str,
+    data_dir: &Path,
+) -> Option<(Vec<u8>, Option<(PathBuf, FileVersion)>)> {
+    if let Some((_, encoded)) = content
         .strip_prefix("data:")
         .and_then(|rest| rest.split_once(','))
-        .map(|(_, encoded)| encoded)
     {
-        return base64::engine::general_purpose::STANDARD.decode(encoded).ok();
+        return Some((
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?,
+            None,
+        ));
     }
-    let first_line = content.lines().next().unwrap_or(content);
-    let path = crate::database::resolve_entry_file_path(first_line, data_dir)?;
-    read_limited(&path)
+    let path = crate::database::resolve_entry_file_path(content, data_dir)?;
+    let version = FileVersion::read(&path)?;
+    if version.len > MAX_IMAGE_BYTES {
+        return None;
+    }
+    Some((std::fs::read(&path).ok()?, Some((path, version))))
 }
 
-fn read_limited(path: &Path) -> Option<Vec<u8>> {
-    let size = std::fs::metadata(path).ok()?.len();
-    (size <= MAX_IMAGE_BYTES).then(|| std::fs::read(path).ok()).flatten()
-}
-
-fn store_result(app: &AppHandle, id: i64, text: &str) {
-    if id > 0 {
-        let _ = app.state::<DbState>().repo.set_ocr_text(id, text);
+fn store_result(
+    app: &AppHandle,
+    version: &EntryVersion,
+    file: Option<(PathBuf, FileVersion)>,
+    text: &str,
+) -> Result<bool, String> {
+    let file_matches = || {
+        file.as_ref()
+            .is_none_or(|(path, version)| FileVersion::read(path) == Some(*version))
+    };
+    let saved = if version.id > 0 {
+        let db = app.state::<DbState>();
+        let conn = db.conn.lock().unwrap();
+        file_matches() && db.repo.store_ocr_for_version(&conn, version, text)?
     } else {
         let session = app.state::<SessionHistory>();
         let mut items = session.0.lock().unwrap();
-        if let Some(item) = items.iter_mut().find(|item| item.id == id) {
+        if let Some(item) = items
+            .iter_mut()
+            .find(|item| version.matches(item) && file_matches())
+        {
             item.ocr_text = Some(text.to_string());
+            true
+        } else {
+            false
         }
+    };
+    if saved {
+        let _ = app.emit("clipboard-ocr-ready", version.id);
     }
-    let _ = app.emit("clipboard-ocr-ready", id);
+    Ok(saved)
 }
 
 struct OcrJob {
-    id: i64,
-    content: String,
+    version: EntryVersion,
     data_dir: PathBuf,
 }
 
@@ -109,12 +135,13 @@ fn queue(app: &AppHandle) -> &'static Sender<OcrJob> {
         let app = app.clone();
         std::thread::spawn(move || {
             for job in receiver {
-                let Some(bytes) = image_bytes(&job.content, &job.data_dir) else {
+                let Some((bytes, file)) = image_bytes(&job.version.content, &job.data_dir) else {
                     continue;
                 };
-                match recognize_text(&bytes) {
-                    Ok(text) => store_result(&app, job.id, &text),
-                    Err(error) => eprintln!("[ocr] entry {} failed: {error}", job.id),
+                if let Err(error) = recognize_text(&bytes)
+                    .and_then(|text| store_result(&app, &job.version, file, &text))
+                {
+                    eprintln!("[ocr] entry {} failed: {error}", job.version.id);
                 }
             }
         });
@@ -122,20 +149,21 @@ fn queue(app: &AppHandle) -> &'static Sender<OcrJob> {
     })
 }
 
-/// Called when an image is captured. Nothing runs on the capture path itself.
-pub fn enqueue(app: &AppHandle, id: i64, content: &str) {
-    if id == 0 {
+pub fn enqueue(app: &AppHandle, entry: &ClipboardEntry) {
+    if entry.id == 0 || entry.ocr_text.is_some() {
         return;
     }
-    if id > 0
-        && matches!(app.state::<DbState>().repo.get_ocr_text(id), Ok(Some(_)))
+    if entry.id > 0
+        && matches!(
+            app.state::<DbState>().repo.get_ocr_text(entry.id),
+            Ok(Some(_))
+        )
     {
-        return; // The same image was copied again.
+        return;
     }
     let data_dir = app.state::<AppDataDir>().0.lock().unwrap().clone();
     let _ = queue(app).send(OcrJob {
-        id,
-        content: content.to_string(),
+        version: EntryVersion::from_entry(entry),
         data_dir,
     });
 }
@@ -147,35 +175,36 @@ pub async fn text_for_entry(
     session: &SessionHistory,
     id: i64,
 ) -> AppResult<String> {
-    let (stored, content) = if id > 0 {
-        let stored = state.repo.get_ocr_text(id).map_err(AppError::Internal)?;
-        let content = state
-            .repo
-            .get_entry_content_with_html(id)
-            .map_err(AppError::Internal)?
-            .map(|(content, _, _)| content);
-        (stored, content)
+    let (stored, version) = if id > 0 {
+        let conn = state.conn.lock().unwrap();
+        let entry = state.repo.get_entry_by_id_with_conn(&conn, id)?;
+        let stored = state.repo.get_ocr_text_with_conn(&conn, id)?;
+        (stored, entry.as_ref().map(EntryVersion::from_entry))
     } else {
         let items = session.0.lock().unwrap();
         let item = items.iter().find(|item| item.id == id);
         (
             item.and_then(|item| item.ocr_text.clone()),
-            item.map(|item| item.content.clone()),
+            item.map(EntryVersion::from_entry),
         )
     };
     if let Some(text) = stored {
         return Ok(text);
     }
-
-    let content = content.ok_or_else(|| AppError::Validation("Item not found".to_string()))?;
+    let version = version.ok_or_else(|| AppError::Validation("Item not found".to_string()))?;
     let data_dir = app.state::<AppDataDir>().0.lock().unwrap().clone();
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let bytes = image_bytes(&content, &data_dir)
+        let (bytes, file) = image_bytes(&version.content, &data_dir)
             .ok_or_else(|| AppError::Validation("file_missing".to_string()))?;
         let text = recognize_text(&bytes).map_err(AppError::Internal)?;
-        store_result(&handle, id, &text);
-        Ok(text)
+        if store_result(&handle, &version, file, &text)? {
+            Ok(text)
+        } else {
+            Err(AppError::Validation(
+                "Image changed during text recognition".into(),
+            ))
+        }
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?

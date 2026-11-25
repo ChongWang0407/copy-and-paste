@@ -13,7 +13,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSString, NSURL};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -60,9 +60,13 @@ fn compute_clipboard_signature() -> u64 {
     hasher.finish()
 }
 
-/// changeCount of a pasteboard write the app made that must not be recorded
-/// (restoring the user's previous clipboard after a transient paste).
-static OWN_CHANGE_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
+/// changeCount of the latest write made by the app.
+static OWN_CHANGE_COUNT: Mutex<Option<isize>> = Mutex::new(None);
+
+fn clear_for_own_write(pb: &NSPasteboard) {
+    let mut own_count = OWN_CHANGE_COUNT.lock().unwrap();
+    *own_count = Some(pb.clearContents());
+}
 
 /// NSPasteboard's change counter (bumped on every write by any app).
 pub fn change_count() -> isize {
@@ -71,13 +75,9 @@ pub fn change_count() -> isize {
 
 }
 
-/// The pasteboard still holds the write restore_pasteboard marked as the app's own.
-pub fn is_own_change() -> bool {
-    #[cfg(target_os = "macos")]
-    return autoreleasepool(|_| {
-        NSPasteboard::generalPasteboard().changeCount() as isize == OWN_CHANGE_COUNT.load(Ordering::SeqCst)
-    });
-
+/// Whether this observed change came from one of our native writers.
+pub fn is_own_change(count: isize) -> bool {
+    *OWN_CHANGE_COUNT.lock().unwrap() == Some(count)
 }
 
 /// Every item on the pasteboard with all its types as raw data, so it can be
@@ -123,8 +123,7 @@ pub fn restore_pasteboard(snapshot: &PasteboardSnapshot) -> Result<(), String> {
         let pb = NSPasteboard::generalPasteboard();
         // Mark the write as ours before the data goes in: the listener can see
         // the new change count while large snapshots are still being copied.
-        let count = pb.clearContents();
-        OWN_CHANGE_COUNT.store(count as isize, Ordering::SeqCst);
+        clear_for_own_write(&pb);
         let mut objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = Vec::new();
         for entries in &snapshot.items {
             let item = NSPasteboardItem::new();
@@ -150,7 +149,7 @@ pub fn set_private_text(text: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     return autoreleasepool(|_| {
         let pb = NSPasteboard::generalPasteboard();
-        pb.clearContents();
+        clear_for_own_write(&pb);
         let written = pb.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString })
             && pb.setString_forType(&NSString::from_str(""), &NSString::from_str("org.nspasteboard.ConcealedType"));
         if written {
@@ -276,20 +275,37 @@ const RAW_IMAGE_TYPES: &[(&str, &str)] = &[
     ("public.png", "png"),
     ("public.jpeg", "jpg"),
     ("org.webmproject.webp", "webp"),
+    ("com.microsoft.bmp", "bmp"),
+    ("public.tiff", "tiff"),
 ];
 
 /// The clipboard image in its original encoding, with its file extension.
-pub fn get_clipboard_image_bytes() -> Option<(Vec<u8>, &'static str)> {
+pub fn get_clipboard_image_bytes(max_bytes: usize) -> Option<(Vec<u8>, &'static str)> {
     #[cfg(target_os = "macos")]
     return autoreleasepool(|_| {
         let pb = NSPasteboard::generalPasteboard();
         RAW_IMAGE_TYPES.iter().find_map(|(uti, ext)| {
             let data = pb.dataForType(&NSString::from_str(uti))?;
-            let bytes = data.to_vec();
-            (!bytes.is_empty()).then_some((bytes, *ext))
+            (!data.is_empty() && data.len() <= max_bytes).then(|| (data.to_vec(), *ext))
         })
     });
 
+}
+
+pub fn encode_clipboard_tiff(bytes: &[u8], max_pixels: usize) -> Option<Vec<u8>> {
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
+    autoreleasepool(|_| {
+        let rep = NSBitmapImageRep::imageRepWithData(&NSData::with_bytes(bytes))?;
+        let width = usize::try_from(rep.pixelsWide()).ok()?;
+        let height = usize::try_from(rep.pixelsHigh()).ok()?;
+        if width.checked_mul(height)? > max_pixels {
+            return None;
+        }
+        unsafe {
+            rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+        }
+        .map(|data| data.to_vec())
+    })
 }
 
 /// Put an image on the pasteboard the way browsers and Finder do: the original
@@ -306,7 +322,7 @@ pub fn set_clipboard_image(
     return autoreleasepool(|_| {
         use objc2_app_kit::{NSBitmapImageRep, NSPasteboardTypeFileURL, NSPasteboardTypeTIFF};
         let pb = NSPasteboard::generalPasteboard();
-        pb.clearContents();
+        clear_for_own_write(&pb);
 
         let original_type = match extension {
             "gif" => "com.compuserve.gif",
@@ -353,14 +369,13 @@ pub fn get_clipboard_html() -> Option<String> {
 
 }
 
-pub fn get_clipboard_rtf() -> Option<Vec<u8>> {
+pub fn get_clipboard_rtf(max_bytes: usize) -> Option<Vec<u8>> {
     #[cfg(target_os = "macos")]
     return autoreleasepool(|_| {
         let pb = NSPasteboard::generalPasteboard();
-        if let Some(data) = unsafe { pb.dataForType(NSPasteboardTypeRTF) } {
-            return Some(data.to_vec());
-        }
-        unsafe { pb.dataForType(NSPasteboardTypeRTFD) }.map(|data| data.to_vec())
+        let data = unsafe { pb.dataForType(NSPasteboardTypeRTF) }
+            .or_else(|| unsafe { pb.dataForType(NSPasteboardTypeRTFD) })?;
+        (data.len() <= max_bytes).then(|| data.to_vec())
     });
 
 }
@@ -373,7 +388,7 @@ pub fn set_clipboard_files(paths: Vec<String>) -> Result<(), String> {
         }
 
         let pb = NSPasteboard::generalPasteboard();
-        pb.clearContents();
+        clear_for_own_write(&pb);
 
         let mut objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> =
             Vec::with_capacity(paths.len());
@@ -411,7 +426,7 @@ pub fn set_clipboard_text_html_rtf_and_image(
     #[cfg(target_os = "macos")]
     return autoreleasepool(|_| {
         let pb = NSPasteboard::generalPasteboard();
-        pb.clearContents();
+        clear_for_own_write(&pb);
 
         let ns_text = NSString::from_str(text);
         unsafe { pb.setString_forType(&ns_text, NSPasteboardTypeString) };
@@ -471,47 +486,101 @@ pub fn set_clipboard_image_with_formats(
     Ok(None)
 }
 pub fn convert_rtf_to_html(rtf_bytes: &[u8]) -> Option<String> {
+    if rtf_bytes.len() > 8 * 1024 * 1024 {
+        return None;
+    }
+    let mut command = Command::new("/usr/bin/textutil");
+    command.args([
+        "-convert",
+        "html",
+        "-stdin",
+        "-stdout",
+        "-format",
+        "rtf",
+        "-encoding",
+        "UTF-8",
+    ]);
+    let output = exchange_subprocess_output(&mut command, rtf_bytes)?;
+    let html = String::from_utf8(output).ok()?.trim().to_string();
+    (!html.is_empty()).then_some(html)
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        let mut child = Command::new("textutil")
-            .args([
-                "-convert",
-                "html",
-                "-stdin",
-                "-stdout",
-                "-format",
-                "rtf",
-                "-encoding",
-                "UTF-8",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .ok()?;
-
-        if let Some(stdin) = child.stdin.as_mut() {
-            if stdin.write_all(rtf_bytes).is_err() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+fn exchange_subprocess_output(command: &mut Command, input: &[u8]) -> Option<Vec<u8>> {
+    use std::time::{Duration, Instant};
+    const MAX_OUTPUT: u64 = 16 * 1024 * 1024;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    std::thread::scope(|threads| {
+        let writer = threads.spawn(move || stdin.write_all(input));
+        let reader = threads.spawn(move || {
+            let mut output = Vec::new();
+            stdout.take(MAX_OUTPUT + 1).read_to_end(&mut output)?;
+            Ok::<_, std::io::Error>(output)
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
             }
-        } else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
+        };
+        writer.join().ok()?.ok()?;
+        let output = reader.join().ok()?.ok()?;
+        (status.success() && output.len() as u64 <= MAX_OUTPUT).then_some(output)
+    })
+}
 
-        let output = child.wait_with_output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let html = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if html.is_empty() {
-            None
-        } else {
-            Some(html)
-        }
+    #[test]
+    #[ignore = "requires a GUI session with access to the macOS pasteboard server"]
+    fn native_write_marks_its_change_but_leaves_the_next_copy_visible() {
+        use objc2_app_kit::NSPasteboardItem;
+        autoreleasepool(|_| {
+            let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+            clear_for_own_write(&pasteboard);
+            let item = NSPasteboardItem::new();
+            assert!(unsafe {
+                item.setString_forType(&NSString::from_str("text"), NSPasteboardTypeString)
+            });
+            assert!(pasteboard.writeObjects(&NSArray::from_retained_slice(&[
+                ProtocolObject::from_retained(item)
+            ])));
+            assert!(is_own_change(pasteboard.changeCount()));
+            pasteboard.clearContents();
+            assert!(!is_own_change(pasteboard.changeCount()));
+        });
+    }
+
+    #[test]
+    fn duplex_subprocess_drains_output_while_writing_input() {
+        let input = b"copied rich text\n".repeat(64 * 1024);
+        let output = exchange_subprocess_output(&mut Command::new("/bin/cat"), &input).unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn converts_an_rtf_document_larger_than_a_pipe() {
+        let input = format!(
+            "{{\\rtf1\\ansi {} final text}}",
+            "bold \\b1 example\\b0 \\par\n".repeat(6000)
+        );
+        let html = convert_rtf_to_html(input.as_bytes()).unwrap();
+        assert!(html.contains("final text"));
+        assert!(html.contains("example"));
     }
 }

@@ -160,6 +160,9 @@ fn main() -> AppResult<()> {
         Ok(app) => {
             info!(">>> [STARTUP] Tauri app built successfully.");
             app.run(|app_handle, event| {
+                if matches!(event, tauri::RunEvent::Exit) {
+                    crate::logger::flush();
+                }
                 if let tauri::RunEvent::ExitRequested { api, .. } = &event {
                     if !crate::app::system::ALLOW_APP_EXIT.load(std::sync::atomic::Ordering::SeqCst)
                     {

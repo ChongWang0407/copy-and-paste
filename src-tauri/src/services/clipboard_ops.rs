@@ -15,8 +15,6 @@ use crate::services::clipboard::{
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use regex::Regex;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use tauri::{Emitter, Manager, State};
@@ -633,56 +631,14 @@ fn macos_previous_app_is_frontmost() -> bool {
         && crate::infrastructure::macos_api::window::get_active_app_snapshot().pid == prev_pid
 }
 
-fn calculate_content_hash(content: &str) -> (u64, u64) {
-    let normalized = crate::services::clipboard::normalize_clipboard_line_endings(content);
-    let mut hasher = DefaultHasher::new();
-    normalized.hash(&mut hasher);
-    let content_hash = hasher.finish();
-
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    (content_hash, current_time)
-}
-
 pub async fn prepare_clipboard_payload(
     content: &str,
     content_type: &str,
     html_content: Option<&str>,
     paste_with_format: bool,
 ) -> AppResult<()> {
-    let (content_hash, current_time) = calculate_content_hash(content);
-    crate::LAST_APP_SET_HASH.store(content_hash, Ordering::SeqCst);
-    crate::LAST_APP_SET_HASH_ALT.store(0, Ordering::SeqCst);
-    crate::LAST_APP_SET_TIMESTAMP.store(current_time, Ordering::SeqCst);
-
-    copy_content_to_system_clipboard(
-        content,
-        content_type,
-        html_content,
-        paste_with_format,
-        content_hash,
-        current_time,
-    )
-    .await
-}
-
-async fn copy_content_to_system_clipboard(
-    content: &str,
-    content_type: &str,
-    html_content: Option<&str>,
-    paste_with_format: bool,
-    content_hash: u64,
-    current_time: u64,
-) -> AppResult<()> {
     match content_type {
         "image" | "video" | "file" => {
-            if content_hash == 0 {
-                crate::LAST_APP_SET_HASH.store(1, Ordering::SeqCst);
-            }
-
             let file_paths = content
                 .lines()
                 .map(str::trim)
@@ -702,15 +658,10 @@ async fn copy_content_to_system_clipboard(
                     let bytes = std::fs::read(image_path).map_err(|_| {
                         AppError::Validation("图片文件已不存在，无法粘贴。".to_string())
                     })?;
-                    let (primary_hash, _secondary_hash) =
-                        copy_image_bytes_to_clipboard(bytes, current_time, Some(image_path))?;
-                    // Keep LAST_APP_SET_HASH as content_hash (path hash)
-                    // Store pixel/byte hash in HASH_ALT
-                    crate::LAST_APP_SET_HASH_ALT.store(primary_hash, Ordering::SeqCst);
+                    copy_image_bytes_to_clipboard(bytes, Some(image_path))?;
                 } else {
                     // Paste the files that still exist. A missing one made
                     // Explorer/Finder abort or error while the app said it worked.
-                    let total = file_paths.len();
                     let file_paths: Vec<String> = file_paths
                         .into_iter()
                         .filter(|path| std::path::Path::new(path).exists())
@@ -720,13 +671,6 @@ async fn copy_content_to_system_clipboard(
                             "这些文件都已不存在，无法粘贴。".to_string(),
                         ));
                     }
-                    if file_paths.len() != total {
-                        // What the monitor will read back, so it isn't re-recorded.
-                        let (hash, _) = calculate_content_hash(&file_paths.join("\n"));
-                        crate::LAST_APP_SET_HASH.store(hash, Ordering::SeqCst);
-                    }
-
-
                     #[cfg(target_os = "macos")]
                     {
                         crate::infrastructure::macos_api::clipboard::set_clipboard_files(
@@ -747,16 +691,20 @@ async fn copy_content_to_system_clipboard(
                     .decode(b64_data)
                     .map_err(|e| AppError::Internal(format!("无法读取图片内容。\n详情：{}", e)))?;
 
-                let (primary_hash, _secondary_hash) =
-                    copy_image_bytes_to_clipboard(bytes, current_time, None)?;
-                // Keep LAST_APP_SET_HASH as content_hash (dataurl hash)
-                // Store pixel/byte hash in HASH_ALT
-                crate::LAST_APP_SET_HASH_ALT.store(primary_hash, Ordering::SeqCst);
+                copy_image_bytes_to_clipboard(bytes, None)?;
             } else {
+                #[cfg(target_os = "macos")]
+                crate::infrastructure::macos_api::clipboard::set_clipboard_text_and_html(
+                    content, "",
+                )
+                .map_err(AppError::Internal)?;
+                #[cfg(not(target_os = "macos"))]
+                {
                 let mut clipboard = arboard::Clipboard::new().map_err(AppError::from)?;
                 clipboard
                     .set_text(content.to_string())
                     .map_err(AppError::from)?;
+                }
             }
         }
         ct if ct == "rich_text" || (paste_with_format && html_content.is_some()) => {
@@ -832,27 +780,6 @@ async fn copy_content_to_system_clipboard(
     Ok(())
 }
 
-fn image_extension_for_bytes(bytes: &[u8]) -> &'static str {
-    if bytes.len() >= 3 && &bytes[0..3] == b"GIF" {
-        "gif"
-    } else if bytes.len() >= 8
-        && bytes[0] == 0x89
-        && &bytes[1..4] == b"PNG"
-        && bytes[4] == 0x0D
-        && bytes[5] == 0x0A
-        && bytes[6] == 0x1A
-        && bytes[7] == 0x0A
-    {
-        "png"
-    } else if bytes.len() >= 3 && &bytes[0..3] == b"\xFF\xD8\xFF" {
-        "jpg"
-    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && bytes.get(8..12) == Some(b"WEBP") {
-        "webp"
-    } else {
-        "png"
-    }
-}
-
 /// Writes the picture of a rich entry as image formats only. Unlike a plain
 /// image paste there is no file next to it: a copied table is not a file, and
 /// chat apps would send one as an attachment.
@@ -870,106 +797,42 @@ fn encode_png_from_rgba(rgba: &image::RgbaImage) -> AppResult<Vec<u8>> {
     Ok(png_buf)
 }
 
-/// macOS: write the stored bytes as they are (see set_clipboard_image). Only
-/// non-PNG images are decoded, for a static PNG of their first frame. The echo
-/// hash is the hash of what the monitor reads back first: the GIF bytes for a
-/// GIF, otherwise the PNG (it used to compare a GIF-bytes hash with a hash of
-/// decoded pixels, so every GIF paste came back as a new flattened entry).
-#[cfg(target_os = "macos")]
-fn copy_image_bytes_to_clipboard_macos(
-    bytes: &[u8],
-    is_gif: bool,
-    source_path: Option<&str>,
-) -> AppResult<(u64, u64)> {
-    let extension = image_extension_for_bytes(bytes);
-    let static_png = if extension == "png" {
-        None
-    } else {
-        let first_frame = image::load_from_memory(bytes)
-            .map_err(|e| AppError::Internal(format!("无法打开图片。\n详情：{}", e)))?
-            .to_rgba8();
-        Some(encode_png_from_rgba(&first_frame)?)
-    };
-    // The file itself lets chat apps and Finder take the animated original.
-    let file_path = source_path
-        .map(str::trim)
-        .filter(|path| is_gif && !path.is_empty() && std::path::Path::new(path).is_file());
-    crate::infrastructure::macos_api::clipboard::set_clipboard_image(
-        bytes,
-        extension,
-        static_png.as_deref(),
-        file_path,
-    )
-    .map_err(AppError::Internal)?;
-
-    let echo_bytes: &[u8] = if is_gif { bytes } else { static_png.as_deref().unwrap_or(bytes) };
-    let mut hasher = DefaultHasher::new();
-    echo_bytes.to_vec().hash(&mut hasher);
-    Ok((hasher.finish(), 0))
-}
-
-fn copy_image_bytes_to_clipboard(
-    bytes: Vec<u8>,
-    current_time: u64,
-    source_path: Option<&str>,
-) -> AppResult<(u64, u64)> {
-    // Check if it's a GIF by magic number
-    let is_gif = bytes.len() > 3 && &bytes[0..3] == b"GIF";
-
+fn copy_image_bytes_to_clipboard(bytes: Vec<u8>, source_path: Option<&str>) -> AppResult<()> {
     #[cfg(target_os = "macos")]
     {
-        crate::LAST_APP_SET_TIMESTAMP.store(current_time, Ordering::SeqCst);
-        return copy_image_bytes_to_clipboard_macos(&bytes, is_gif, source_path);
+        let extension = crate::database::image_extension_from_magic(&bytes).unwrap_or("png");
+        let static_png = if extension == "png" {
+            None
+        } else {
+            let image = image::load_from_memory(&bytes)
+                .map_err(|e| AppError::Internal(format!("无法打开图片。\n详情：{e}")))?
+                .into_rgba8();
+            Some(encode_png_from_rgba(&image)?)
+        };
+        let file_path = source_path.map(str::trim).filter(|path| {
+            extension == "gif" && !path.is_empty() && std::path::Path::new(path).is_file()
+        });
+        crate::infrastructure::macos_api::clipboard::set_clipboard_image(
+            &bytes,
+            extension,
+            static_png.as_deref(),
+            file_path,
+        )
+        .map_err(AppError::Internal)?;
     }
 
-    #[allow(unreachable_code)]
-    let (width, height, raw_bytes) = {
-        let img = image::load_from_memory(&bytes)
-            .map_err(|e| AppError::Internal(format!("无法打开图片。\n详情：{}", e)))?
-            .to_rgba8();
-        let (w, h) = img.dimensions();
-        (w, h, img.into_raw())
-    };
-
-    crate::LAST_APP_SET_TIMESTAMP.store(current_time, Ordering::SeqCst);
-
-    let (primary_hash, secondary_hash) = if is_gif {
-        let mut hasher = DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        let byte_hash = hasher.finish();
-
-        // Calculate pixel hash of the first frame as a secondary fingerprint
-        let pixel_count = (width as u64) * (height as u64);
-        let mut h = pixel_count;
-        if !raw_bytes.is_empty() {
-            h = h
-                .wrapping_add(raw_bytes[0] as u64)
-                .wrapping_add(raw_bytes[raw_bytes.len() / 2] as u64)
-                .wrapping_add(raw_bytes[raw_bytes.len() - 1] as u64);
-        }
-        (byte_hash, h)
-    } else {
-        // Hash full pixel bytes so the monitor can skip our own image copy
-        let mut hasher = DefaultHasher::new();
-        raw_bytes.hash(&mut hasher);
-        let byte_hash = hasher.finish();
-        (byte_hash, 0)
-    };
-
-
+    #[cfg(not(target_os = "macos"))]
     {
         let _ = source_path;
-        let mut clipboard = arboard::Clipboard::new().map_err(AppError::from)?;
-        clipboard
-            .set_image(arboard::ImageData {
-                width: width as usize,
-                height: height as usize,
-                bytes: raw_bytes.into(),
-            })
-            .map_err(AppError::from)?;
+        let rgba = image::load_from_memory(&bytes)?.into_rgba8();
+        let (width, height) = rgba.dimensions();
+        arboard::Clipboard::new()?.set_image(arboard::ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: rgba.into_raw().into(),
+        })?;
     }
-
-    Ok((primary_hash, secondary_hash))
+    Ok(())
 }
 
 async fn copy_text_with_retry(content: &str) -> AppResult<()> {

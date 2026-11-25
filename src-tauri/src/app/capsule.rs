@@ -15,8 +15,8 @@
 //! - `island` 黑色刘海: black, grown out of the notch on a screen that has
 //!   one; elsewhere a black pill at the top edge.
 
-use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, Once};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -52,7 +52,6 @@ pub fn normalize_duration(value: &str) -> u64 {
 /// The page fades its content out for this long before the pill shrinks.
 const CONTENT_FADE_OUT: Duration = Duration::from_millis(140);
 /// A paste writes the clipboard too; the capsule is for the user's own copies.
-const AFTER_PASTE_QUIET_SECS: u64 = 2;
 const PREVIEW_CHARS: usize = 64;
 
 pub fn normalize_style(style: &str) -> &'static str {
@@ -259,10 +258,13 @@ fn payload_for(app: &AppHandle, entry: &ClipboardEntry) -> CapsulePayload {
         "image" => {
             let path = entry.content.trim();
             if !path.starts_with("data:") && std::path::Path::new(path).is_file() {
-                payload.image_path = crate::app::commands::thumbnail_cmd::thumbnail_dir(app)
-                    .ok()
-                    .and_then(|dir| crate::app::commands::thumbnail_cmd::build_thumbnail(path, &dir).ok())
-                    .or_else(|| Some(path.to_string()));
+                payload.image_path =
+                    crate::app::commands::thumbnail_cmd::thumbnail_dir_for_path(app, path)
+                        .ok()
+                        .and_then(|dir| {
+                            crate::app::commands::thumbnail_cmd::build_thumbnail(path, &dir).ok()
+                        })
+                        .or_else(|| Some(path.to_string()));
             }
         }
         "file" | "video" => {
@@ -290,27 +292,50 @@ fn language(app: &AppHandle) -> String {
 }
 
 /// Called for every recorded copy (pipeline `DistributionStage`).
+struct CopyNotification {
+    app: AppHandle,
+    entry: ClipboardEntry,
+    style: &'static str,
+    sequence: u64,
+}
+
+static COPY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PENDING_COPY: (Mutex<Option<CopyNotification>>, Condvar) =
+    (Mutex::new(None), Condvar::new());
+
 pub fn notify_copied(app: &AppHandle, entry: &ClipboardEntry) {
     let settings = app.state::<SettingsState>();
     if !settings.capsule_enabled.load(Ordering::Relaxed) {
         return;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let last_paste = crate::LAST_APP_SET_TIMESTAMP.load(Ordering::SeqCst);
-    if last_paste != 0 && now.saturating_sub(last_paste) < AFTER_PASTE_QUIET_SECS {
-        return;
-    }
     let style = normalize_style(&settings.capsule_style.lock().map(|s| s.clone()).unwrap_or_default());
-    // Icon lookup and the image thumbnail can take a moment; the capture
-    // worker shouldn't wait for them.
-    let app = app.clone();
-    let entry = entry.clone();
-    std::thread::spawn(move || {
-        let payload = payload_for(&app, &entry);
-        present(&app, payload, style);
+    let mut pending = PENDING_COPY.0.lock().unwrap();
+    let sequence = COPY_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+    *pending = Some(CopyNotification {
+        app: app.clone(),
+        entry: entry.clone(),
+        style,
+        sequence,
+    });
+    PENDING_COPY.1.notify_one();
+    static WORKER: Once = Once::new();
+    WORKER.call_once(|| {
+        std::thread::spawn(|| loop {
+            let ready = PENDING_COPY.0.lock().unwrap();
+            let notification = PENDING_COPY
+                .1
+                .wait_while(ready, |item| item.is_none())
+                .unwrap()
+                .take()
+                .expect("pending copy notification");
+            let payload = payload_for(&notification.app, &notification.entry);
+            present(
+                &notification.app,
+                payload,
+                notification.style,
+                notification.sequence,
+            );
+        });
     });
 }
 
@@ -333,7 +358,8 @@ pub fn preview_capsule(app_handle: AppHandle, style: Option<String>) {
         app_name: "Copy & Paste".into(),
         ..Default::default()
     };
-    present(&app_handle, payload, style);
+    let sequence = COPY_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+    present(&app_handle, payload, style, sequence);
 }
 
 // ---------------------------------------------------------------------------
@@ -356,10 +382,13 @@ fn emit_show(app: &AppHandle, mut payload: CapsulePayload, style: &str, geometry
     let _ = app.emit_to(LABEL, "capsule-show", payload);
 }
 
-fn present(app: &AppHandle, payload: CapsulePayload, style: &'static str) {
+fn present(app: &AppHandle, payload: CapsulePayload, style: &'static str, sequence: u64) {
     let Some(win) = window(app) else { return };
     let handle = app.clone();
     let _ = win.clone().run_on_main_thread(move || {
+        if sequence != COPY_SEQUENCE.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(screen) = native::current_screen() else { return };
         let geometry = geometry_for(style, screen);
 
@@ -409,8 +438,8 @@ fn show_for(app: &AppHandle) -> Duration {
 }
 
 fn schedule_hide(app: AppHandle, hide_gen: u64) {
-    std::thread::spawn(move || {
-        std::thread::sleep(show_for(&app));
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(show_for(&app)).await;
         begin_hide(app, hide_gen);
     });
 }
@@ -424,8 +453,8 @@ fn begin_hide(app: AppHandle, hide_gen: u64) {
         st.hiding = true;
     }
     let _ = app.emit_to(LABEL, "capsule-hide", ());
-    std::thread::spawn(move || {
-        std::thread::sleep(CONTENT_FADE_OUT);
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(CONTENT_FADE_OUT).await;
         let Some(win) = window(&app) else { return };
         let target = win.clone();
         let _ = win.run_on_main_thread(move || {
@@ -438,7 +467,7 @@ fn begin_hide(app: AppHandle, hide_gen: u64) {
             native::set_mask(&target, geometry.collapsed, geometry.notch, Some(COLLAPSE));
         });
         // Order it out once the shrink is over, unless a copy brought it back.
-        std::thread::sleep(COLLAPSE.duration + Duration::from_millis(40));
+        tokio::time::sleep(COLLAPSE.duration + Duration::from_millis(40)).await;
         let Some(win) = window(&app) else { return };
         let target = win.clone();
         let _ = win.run_on_main_thread(move || {
@@ -457,6 +486,7 @@ fn begin_hide(app: AppHandle, hide_gen: u64) {
 
 /// Hides it at once (the switch was turned off).
 pub fn dismiss(app: &AppHandle) {
+    COPY_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     let hide_gen = {
         let mut st = state();
         st.hide_gen += 1;

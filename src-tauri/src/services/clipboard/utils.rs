@@ -1,8 +1,7 @@
-use crate::database::{is_text_type, save_image_to_file};
+use crate::database::{attachment_extension, is_text_type, stable_bytes_hash, PendingAttachments};
 use crate::domain::models::ClipboardEntry;
 use base64::{engine::general_purpose, Engine as _};
 use regex::Regex;
-use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
@@ -38,26 +37,6 @@ fn normalize_image_ext(ext: &str) -> Option<&'static str> {
         "bmp" => Some("bmp"),
         _ => None,
     }
-}
-
-fn image_ext_from_mime(mime: &str) -> Option<&'static str> {
-    match mime {
-        "image/png" => Some("png"),
-        "image/jpeg" => Some("jpg"),
-        "image/gif" => Some("gif"),
-        "image/webp" => Some("webp"),
-        "image/bmp" => Some("bmp"),
-        _ => None,
-    }
-}
-
-fn image_ext_from_url(url: &str) -> Option<&'static str> {
-    let parsed = reqwest::Url::parse(url).ok()?;
-    let ext = Path::new(parsed.path())
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    normalize_image_ext(ext)
 }
 
 fn image_ext_from_bytes(bytes: &[u8]) -> Option<&'static str> {
@@ -101,7 +80,7 @@ fn fetch_remote_image(url: &str) -> Option<(Vec<u8>, &'static str)> {
             .timeout(Duration::from_secs(REMOTE_IMAGE_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::limited(8))
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+            .expect("build image download client")
     });
 
     let resp = client.get(url).header("Accept", "image/*").send().ok()?;
@@ -115,17 +94,6 @@ fn fetch_remote_image(url: &str) -> Option<(Vec<u8>, &'static str)> {
         return None;
     }
 
-    let mime = resp
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
     let mut limited = resp.take((REMOTE_IMAGE_MAX_BYTES as u64) + 1);
     let mut bytes = Vec::new();
     if limited.read_to_end(&mut bytes).is_err() {
@@ -135,9 +103,7 @@ fn fetch_remote_image(url: &str) -> Option<(Vec<u8>, &'static str)> {
         return None;
     }
 
-    let ext = image_ext_from_mime(&mime)
-        .or_else(|| image_ext_from_url(url))
-        .or_else(|| image_ext_from_bytes(&bytes))?;
+    let ext = image_ext_from_bytes(&bytes)?;
 
     Some((bytes, ext))
 }
@@ -282,13 +248,6 @@ fn resolve_animated_image_src_to_data_url(src: &str) -> Option<String> {
         return gif_data_url_from_bytes(&bytes);
     }
 
-    if let Some(remote_url) = normalize_remote_img_url(value) {
-        let (bytes, ext) = fetch_remote_image(&remote_url)?;
-        if ext == "gif" {
-            return gif_data_url_from_bytes(&bytes);
-        }
-    }
-
     None
 }
 
@@ -361,21 +320,6 @@ pub fn extract_first_image_data_url_from_html(html: &str) -> Option<String> {
 pub fn extract_animated_image_data_url_from_text(text: &str) -> Option<String> {
     let candidate = normalize_html_image_src_candidate(text)?;
     resolve_animated_image_src_to_data_url(&candidate)
-}
-
-fn save_image_bytes_to_attachments(
-    bytes: &[u8],
-    ext: &str,
-    attachments_dir: &Path,
-) -> Option<String> {
-    let ext = normalize_image_ext(ext)?;
-    let target = crate::database::write_attachment(attachments_dir, bytes, ext)?;
-    let path = target.to_string_lossy().replace('\\', "/");
-    if path.starts_with('/') {
-        Some(format!("file://{}", path))
-    } else {
-        Some(format!("file:///{}", path))
-    }
 }
 
 /// Normalize line endings only; keep leading/trailing spaces and tabs (#97).
@@ -1495,7 +1439,11 @@ pub fn encode_cf_html(fragment: &str) -> String {
     )
 }
 
-pub fn externalize_rich_image_fallback(html: &str, data_dir: &Path) -> String {
+pub fn externalize_rich_image_fallback(
+    html: &str,
+    data_dir: &Path,
+    pending: &mut PendingAttachments,
+) -> String {
     let (clean_html, payload_opt) = split_rich_html_and_image_fallback(html);
     let Some(payload) = payload_opt else {
         return html.to_string();
@@ -1505,13 +1453,22 @@ pub fn externalize_rich_image_fallback(html: &str, data_dir: &Path) -> String {
         return html.to_string();
     }
 
-    if let Some(saved_path) = save_image_to_file(&payload, data_dir) {
+    if let Some(saved_path) = payload.split_once(',').and_then(|(_, encoded)| {
+        let bytes = general_purpose::STANDARD.decode(encoded).ok()?;
+        let extension = attachment_extension(&bytes, "png");
+        pending.write(
+            &data_dir.join("attachments"),
+            &bytes,
+            extension,
+            stable_bytes_hash(&bytes),
+        )
+    }) {
         let base_html = if clean_html.trim().is_empty() {
             html
         } else {
             clean_html.as_str()
         };
-        return attach_rich_image_fallback(base_html, &saved_path);
+        return attach_rich_image_fallback(base_html, &saved_path.to_string_lossy());
     }
 
     html.to_string()
@@ -2747,169 +2704,141 @@ pub fn app_cleanup_policy_matches(
     false
 }
 
-pub fn embed_local_images(html: &str) -> String {
-    let re = match Regex::new(r#"(<img\s+[^>]*src=["'])([^"']+)(["'][^>]*>)"#) {
-        Ok(r) => r,
-        Err(_) => return html.to_string(),
-    };
-
-    re.replace_all(html, |caps: &regex::Captures| {
-        let prefix = &caps[1];
-        let src = &caps[2];
-        let suffix = &caps[3];
-
-        let is_local = src.starts_with("file://")
-            || (src.len() > 2
-                && src.chars().nth(1) == Some(':')
-                && (src.chars().nth(2) == Some('\\') || src.chars().nth(2) == Some('/')));
-
-        if is_local {
-            let path_str = if src.starts_with("file://") {
-                let raw_path = src.trim_start_matches("file://");
-                if raw_path.starts_with('/') && raw_path.chars().nth(2) == Some(':') {
-                    &raw_path[1..]
-                } else {
-                    raw_path
-                }
-            } else {
-                src
-            };
-
-            let decoded_path = decode(path_str)
-                .map(|p| p.into_owned())
-                .unwrap_or(path_str.to_string());
-            let clean_path = decoded_path
-                .split('?')
-                .next()
-                .unwrap_or(&decoded_path)
-                .split('#')
-                .next()
-                .unwrap_or(&decoded_path);
-
-            let path = std::path::Path::new(clean_path);
-            if path.exists() {
-                if let Ok(data) = std::fs::read(path) {
-                    let ext = path
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("png")
-                        .to_lowercase();
-                    let mime = match ext.as_str() {
-                        "jpg" | "jpeg" => "image/jpeg",
-                        "gif" => "image/gif",
-                        "webp" => "image/webp",
-                        "bmp" => "image/bmp",
-                        "svg" => "image/svg+xml",
-                        _ => "image/png",
-                    };
-                    let b64 = general_purpose::STANDARD.encode(&data);
-                    return format!(
-                        "{}{}{}",
-                        prefix,
-                        format!("data:{};base64,{}", mime, b64),
-                        suffix
-                    );
-                }
-            }
-        }
-
-        if let Some(remote_url) = normalize_remote_img_url(src) {
-            if let Some((bytes, ext)) = fetch_remote_image(&remote_url) {
-                let b64 = general_purpose::STANDARD.encode(&bytes);
-                let mime = image_mime_by_ext(ext);
-                let data_url = format!("data:{};base64,{}", mime, b64);
-                return format!("{}{}{}", prefix, data_url, suffix);
-            }
-        }
-        format!("{}{}{}", prefix, src, suffix)
-    })
-    .to_string()
+fn html_image_sources() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(
+        r#"(?i)(<img\b[^>]*?\s+src\s*=\s*["'])([^"']+)(["'][^>]*>)(?:<!--CP_REMOTE_SRC:([A-Za-z0-9+/=]+)-->)?"#,
+    ).expect("image source pattern"))
 }
 
-pub fn process_local_images_in_html(html: &str, data_dir: &std::path::Path) -> String {
-    let attachments_dir = data_dir.join("attachments");
-    if !attachments_dir.exists() {
-        let _ = std::fs::create_dir_all(&attachments_dir);
+fn local_image_bytes(src: &str) -> Option<(Vec<u8>, std::path::PathBuf)> {
+    let path = resolve_local_image_src_path(src)?;
+    let file = std::fs::File::open(&path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
     }
+    let mut bytes = Vec::new();
+    file.take((super::MAX_CAPTURE_IMAGE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= super::MAX_CAPTURE_IMAGE_BYTES).then_some((bytes, path))
+}
 
-    let re = match Regex::new(r#"(<img\s+[^>]*src=["'])([^"']+)(["'][^>]*>)"#) {
-        Ok(r) => r,
-        Err(_) => return html.to_string(),
-    };
-
-    re.replace_all(html, |caps: &regex::Captures| {
-        let prefix = &caps[1];
-        let src = &caps[2];
-        let suffix = &caps[3];
-
-        let is_local = src.starts_with("file://")
-            || (src.len() > 2
-                && src.chars().nth(1) == Some(':')
-                && (src.chars().nth(2) == Some('\\') || src.chars().nth(2) == Some('/')));
-
-        if is_local {
-            let path_str = if src.starts_with("file://") {
-                let raw_path = src.trim_start_matches("file://");
-                if raw_path.starts_with('/') && raw_path.chars().nth(2) == Some(':') {
-                    &raw_path[1..]
+pub fn embed_local_images(html: &str) -> String {
+    html_image_sources()
+        .replace_all(html, |caps: &regex::Captures| {
+            if let Some((data, path)) = local_image_bytes(&caps[2]) {
+                let ext = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("png");
+                let mime = if ext.eq_ignore_ascii_case("svg") {
+                    "image/svg+xml"
                 } else {
-                    raw_path
-                }
+                    image_mime_by_ext(normalize_image_ext(ext).unwrap_or("png"))
+                };
+                let data = general_purpose::STANDARD.encode(data);
+                format!("{}data:{mime};base64,{data}{}", &caps[1], &caps[3])
             } else {
-                src
+                caps[0].to_string()
+            }
+        })
+        .into_owned()
+}
+
+pub fn process_local_images_in_html(
+    html: &str,
+    data_dir: &Path,
+    pending: &mut PendingAttachments,
+) -> String {
+    let attachments = data_dir.join("attachments");
+    html_image_sources()
+        .replace_all(html, |caps: &regex::Captures| {
+            let Some((data, path)) = local_image_bytes(&caps[2]) else {
+                return caps[0].to_string();
             };
-
-            let decoded_path = decode(path_str)
-                .map(|p| p.into_owned())
-                .unwrap_or(path_str.to_string());
-            let clean_path = decoded_path
-                .split('?')
-                .next()
-                .unwrap_or(&decoded_path)
-                .split('#')
-                .next()
-                .unwrap_or(&decoded_path);
-            let path = std::path::Path::new(clean_path);
-
-            if path.starts_with(&attachments_dir) {
-                return format!("{}{}{}", prefix, src, suffix);
+            if path.starts_with(&attachments) {
+                pending.protect(&path);
+                return caps[0].to_string();
             }
+            let ext = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("png")
+                .to_ascii_lowercase();
+            let Some(target) = pending.write(&attachments, &data, &ext, stable_bytes_hash(&data))
+            else {
+                return caps[0].to_string();
+            };
+            format!("{}file://{}{}", &caps[1], target.display(), &caps[3])
+        })
+        .into_owned()
+}
 
-            if path.exists() {
-                if let Ok(data) = std::fs::read(path) {
-                    let ext = path
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("png")
-                        .to_lowercase();
-                    let Some(new_path) = crate::database::write_attachment(&attachments_dir, &data, &ext)
-                    else {
-                        return format!("{}{}{}", prefix, src, suffix);
-                    };
+pub(crate) fn has_remote_images(html: &str) -> bool {
+    html_image_sources()
+        .captures_iter(html)
+        .any(|caps| normalize_remote_img_url(&caps[2]).is_some())
+}
 
-                    let new_src = new_path.to_string_lossy().replace('\\', "/");
-                    let final_src = if new_src.starts_with('/') {
-                        format!("file://{}", new_src)
-                    } else {
-                        format!("file:///{}", new_src)
-                    };
-                    return format!("{}{}{}", prefix, final_src, suffix);
+pub(crate) fn localize_remote_images(
+    html: &str,
+    data_dir: Option<&Path>,
+    pending: &mut PendingAttachments,
+) -> String {
+    const MAX_IMAGES: usize = 8;
+    let attachments = data_dir.map(|dir| dir.join("attachments"));
+    let mut images = std::collections::HashMap::new();
+    let mut remaining_bytes = super::MAX_PIPELINE_HTML_BYTES.saturating_sub(html.len());
+    html_image_sources()
+        .replace_all(html, |caps: &regex::Captures| {
+            let Some(url) = normalize_remote_img_url(&caps[2]) else {
+                return caps[0].to_string();
+            };
+            if images.len() < MAX_IMAGES && !images.contains_key(&url) {
+                let source = fetch_remote_image(&url).and_then(|(bytes, ext)| {
+                    if let Some(attachments) = &attachments {
+                        let target =
+                            pending.write(attachments, &bytes, ext, stable_bytes_hash(&bytes))?;
+                        return Some(format!("file://{}", target.display()));
+                    }
+                    let estimated_size = bytes.len().div_ceil(3) * 4 + 64;
+                    if estimated_size > super::MAX_PIPELINE_HTML_BYTES {
+                        return None;
+                    }
+                    let encoded = general_purpose::STANDARD.encode(bytes);
+                    Some(format!("data:{};base64,{encoded}", image_mime_by_ext(ext)))
+                });
+                images.insert(url.clone(), source);
+            }
+            if let Some(Some(source)) = images.get(&url) {
+                let original = general_purpose::STANDARD.encode(&caps[2]);
+                let marker = format!("<!--CP_REMOTE_SRC:{original}-->");
+                let growth = (source.len() + marker.len()).saturating_sub(caps[2].len());
+                if growth <= remaining_bytes {
+                    remaining_bytes -= growth;
+                    return format!("{}{source}{}{marker}", &caps[1], &caps[3]);
                 }
             }
-        }
+            caps[0].to_string()
+        })
+        .into_owned()
+}
 
-        if let Some(remote_url) = normalize_remote_img_url(src) {
-            if let Some((bytes, ext)) = fetch_remote_image(&remote_url) {
-                if let Some(file_src) =
-                    save_image_bytes_to_attachments(&bytes, ext, &attachments_dir)
-                {
-                    return format!("{}{}{}", prefix, file_src, suffix);
-                }
-            }
+pub(crate) fn html_with_original_image_sources(html: &str) -> std::borrow::Cow<'_, str> {
+    if !html.contains("<!--CP_REMOTE_SRC:") {
+        return std::borrow::Cow::Borrowed(html);
+    }
+    html_image_sources().replace_all(html, |caps: &regex::Captures| {
+        let original = caps
+            .get(4)
+            .and_then(|s| general_purpose::STANDARD.decode(s.as_str()).ok())
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        match original {
+            Some(src) => format!("{}{src}{}", &caps[1], &caps[3]),
+            None => caps[0].to_string(),
         }
-        format!("{}{}{}", prefix, src, suffix)
     })
-    .to_string()
 }
 
 pub fn parse_cf_html(raw: &[u8]) -> Option<String> {

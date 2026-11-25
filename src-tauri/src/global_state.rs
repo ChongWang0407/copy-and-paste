@@ -88,9 +88,6 @@ pub fn set_last_active_app_name(name: String) {
     *cell.lock().unwrap() = name;
 }
 
-pub static LAST_APP_SET_HASH: AtomicU64 = AtomicU64::new(0);
-pub static LAST_APP_SET_HASH_ALT: AtomicU64 = AtomicU64::new(0);
-pub static LAST_APP_SET_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 pub static LAST_TOGGLE_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 pub static LAST_SHOW_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
