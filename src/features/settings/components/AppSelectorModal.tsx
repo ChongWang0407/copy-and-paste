@@ -22,13 +22,14 @@ const AppSelectorModal = ({ show, installedApps, theme, colorMode, t, onClose, o
         open={Boolean(show)}
         onClose={onClose}
         theme={theme}
-        panelClassName="modal-panel modal-panel-form modal-panel-wide modal-panel-app-selector"
+        overlayClassName="modal-overlay-app-selector"
+        panelClassName="modal-panel glass-popover modal-panel-app-selector"
         ariaLabel={t("select_app_title")}
     >
         <div className="modal-panel-header">
             <h3 className="modal-title">{t("select_app_title")}</h3>
             <button type="button" className="modal-button icon-only" onClick={onClose} aria-label={t("cancel")}>
-                <X size={18} />
+                <X size={15} />
             </button>
         </div>
 
@@ -46,7 +47,7 @@ const AppSelectorModal = ({ show, installedApps, theme, colorMode, t, onClose, o
             />
         </div>
 
-        <div className="modal-panel-actions split">
+        <div className="modal-panel-actions">
             {resetLabel && (
                 <button
                     type="button"
@@ -67,13 +68,14 @@ const AppSelectorModal = ({ show, installedApps, theme, colorMode, t, onClose, o
                     try {
                         const selected = await withNativeDialog(() => open({
                             multiple: false,
+                            defaultPath: "/Applications",
                             filters: [{
                                 name: "Applications",
-                                extensions: ["exe", "cmd", "bat", "lnk"]
+                                extensions: ["app"]
                             }]
                         }), "settings:choose-application");
-                        if (selected && show) {
-                            onSave(show, selected as string);
+                        if (typeof selected === "string" && show) {
+                            onSave(show, selected);
                             onClose();
                         }
                     } catch (err) {

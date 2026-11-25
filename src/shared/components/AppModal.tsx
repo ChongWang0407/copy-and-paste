@@ -57,7 +57,7 @@ const AppModal = ({
     const focusInitialControl = requestAnimationFrame(() => {
       const panel = panelRef.current;
       if (!panel) return;
-      const autofocusTarget = panel.querySelector<HTMLElement>("[autofocus]");
+      const autofocusTarget = panel.querySelector<HTMLElement>("[autofocus], [data-autofocus]");
       const firstFocusable = panel.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
       (autofocusTarget || firstFocusable || panel).focus({ preventScroll: true });
     });

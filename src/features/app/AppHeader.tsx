@@ -1,19 +1,20 @@
-import { ArrowLeft, Pin, PinOff, Settings as SettingsIcon, Star, Trash2 } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
+import { ArrowLeft, Pin, Settings as SettingsIcon, Star, Trash2 } from "lucide-react";
+import { showNativeMenu } from "../../shared/lib/nativeMenu";
 import { startWindowDrag } from "../../shared/lib/windowDrag";
-import type { Translate } from "../../shared/types";
+import type { Translate, WindowPinMode } from "../../shared/types";
 
 interface AppHeaderProps {
   t: Translate;
   displayName: string;
   showSettings: boolean;
   isWindowPinned: boolean;
+  pinMode: WindowPinMode;
   favoritesOpen: boolean;
   onBack: () => void;
   onToggleFavorites: () => void;
   onTogglePinned: () => void;
-  /** The red button while pinned: only Esc closes, so it just reminds. */
-  onPinnedCloseAttempt: () => void;
+  onSelectPinMode: (mode: WindowPinMode) => void;
+  onCloseWindow: () => void;
   onClearHistory: () => void;
   onOpenSettings: () => void;
 }
@@ -23,15 +24,22 @@ const AppHeader = ({
   displayName,
   showSettings,
   isWindowPinned,
+  pinMode,
   favoritesOpen,
   onBack,
   onToggleFavorites,
   onTogglePinned,
-  onPinnedCloseAttempt,
+  onSelectPinMode,
+  onCloseWindow,
   onClearHistory,
   onOpenSettings,
-}: AppHeaderProps) => (
-  <header className="app-header" onMouseDown={startWindowDrag}>
+}: AppHeaderProps) => {
+  const alwaysOnTop = pinMode === "always_on_top";
+  const pinTooltip = t(isWindowPinned
+    ? (alwaysOnTop ? "unpin_window_top_tip" : "unpin_window_normal_tip")
+    : (alwaysOnTop ? "pin_window_top_tip" : "pin_window_normal_tip"));
+
+  return <header className="app-header" onMouseDown={startWindowDrag}>
     <button
       type="button"
       className="traffic-close"
@@ -45,11 +53,7 @@ const AppHeader = ({
       }}
       onClick={(event) => {
         event.stopPropagation();
-        if (isWindowPinned) {
-          onPinnedCloseAttempt();
-          return;
-        }
-        invoke("hide_window_cmd").catch(console.error);
+        onCloseWindow();
       }}
     >
       <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -79,13 +83,22 @@ const AppHeader = ({
           </button>
           <button
             type="button"
-            className={`icon-button${isWindowPinned ? " is-active" : ""}`}
-            title={isWindowPinned ? t("unpin_window") : t("pin_window")}
-            aria-label={isWindowPinned ? t("unpin_window") : t("pin_window")}
+            className={`icon-button${isWindowPinned ? (alwaysOnTop ? " is-active is-pin-top" : " is-active is-pin-normal") : ""}`}
+            title={pinTooltip}
+            aria-label={pinTooltip}
             aria-pressed={isWindowPinned}
             onClick={onTogglePinned}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              const box = event.currentTarget.getBoundingClientRect();
+              void showNativeMenu([
+                { text: t("pin_mode_always_on_top"), checked: alwaysOnTop, action: () => onSelectPinMode("always_on_top") },
+                { text: t("pin_mode_normal"), checked: !alwaysOnTop, action: () => onSelectPinMode("normal") },
+              ], { x: box.left, y: box.bottom + 4 });
+            }}
           >
-            {isWindowPinned ? <PinOff size={15} /> : <Pin size={15} />}
+            <Pin size={15} className="pin-icon" />
           </button>
           <button
             type="button"
@@ -108,7 +121,7 @@ const AppHeader = ({
         </div>
       </>
     )}
-  </header>
-);
+  </header>;
+};
 
 export default AppHeader;

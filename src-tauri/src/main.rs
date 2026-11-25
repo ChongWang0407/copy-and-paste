@@ -129,6 +129,7 @@ fn main() -> AppResult<()> {
             app::commands::check_macos_permissions,
             app::commands::request_macos_permissions,
             app::window_manager::set_panel_lowered,
+            app::commands::set_window_pin_mode,
             app::commands::get_macos_accessibility_binary_path,
             app::commands::open_macos_accessibility_settings,
             app::commands::register_hotkey,

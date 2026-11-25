@@ -1,6 +1,8 @@
 use crate::app_state::SettingsState;
+use crate::database::DbState;
 use crate::error::{AppError, AppResult};
-use crate::global_state::HOTKEY_STRING;
+use crate::global_state::{HOTKEY_STRING, IS_RECORDING};
+use crate::infrastructure::repository::settings_repo::SettingsRepository;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Manager};
@@ -74,10 +76,18 @@ fn register_unique_shortcut(
 }
 
 pub fn sync_registered_hotkeys(app_handle: &AppHandle) -> AppResult<()> {
-    let _ = app_handle.global_shortcut().unregister_all();
-
+    if IS_RECORDING.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let settings = app_handle.state::<SettingsState>();
     let main_hotkey = settings.main_hotkey.lock().unwrap().clone();
+    apply_registered_hotkeys(app_handle, &main_hotkey)
+}
+
+fn apply_registered_hotkeys(app_handle: &AppHandle, main_hotkey: &str) -> AppResult<()> {
+    app_handle.global_shortcut().unregister_all()
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let settings = app_handle.state::<SettingsState>();
     let sequential_hotkey = settings.sequential_paste_hotkey.lock().unwrap().clone();
     let sequential_mode = settings.sequential_mode.load(Ordering::Relaxed);
     let mut registered = HashSet::new();
@@ -93,8 +103,8 @@ pub fn sync_registered_hotkeys(app_handle: &AppHandle) -> AppResult<()> {
         }
     };
 
-    if should_register_main_hotkey(&main_hotkey) {
-        register(&main_hotkey);
+    if should_register_main_hotkey(main_hotkey) {
+        register(main_hotkey);
     }
 
     // Only bind sequential paste while the mode is enabled (#125).
@@ -119,17 +129,27 @@ pub fn sync_registered_hotkeys_on_main_thread(app_handle: &AppHandle) {
 
 #[tauri::command]
 pub fn register_hotkey(app_handle: AppHandle, hotkey: String) -> AppResult<()> {
-    {
-        let mut guard = HOTKEY_STRING.lock().unwrap();
-        *guard = hotkey.clone();
+    let settings = app_handle.state::<SettingsState>();
+    let previous = settings.main_hotkey.lock().unwrap().clone();
+    let result = apply_registered_hotkeys(&app_handle, &hotkey).and_then(|()| {
+        app_handle
+            .state::<DbState>()
+            .settings_repo
+            .set("app.hotkey", &hotkey)
+            .map_err(AppError::from)
+    });
+    if let Err(error) = result {
+        if let Err(restore_error) = apply_registered_hotkeys(&app_handle, &previous) {
+            return Err(AppError::Internal(format!("{error}\n{restore_error}")));
+        }
+        crate::app::hooks::update_recording_flags(false);
+        return Err(error);
     }
 
-    if let Some(settings) = app_handle.try_state::<SettingsState>() {
-        let mut guard = settings.main_hotkey.lock().unwrap();
-        *guard = hotkey.clone();
-    }
-
-    sync_registered_hotkeys(&app_handle)
+    *settings.main_hotkey.lock().unwrap() = hotkey.clone();
+    *HOTKEY_STRING.lock().unwrap() = hotkey;
+    crate::app::hooks::update_recording_flags(false);
+    Ok(())
 }
 
 /// Shift alone (or no modifier) plus a key that types text: registered
@@ -201,9 +221,17 @@ pub fn test_hotkey_available(
         .parse::<Shortcut>()
         .map_err(|_| AppError::Validation("请重新设置快捷键组合。".to_string()))?;
 
+    let settings = app_handle.state::<SettingsState>();
+    if parse_shortcut(&settings.main_hotkey.lock().unwrap()).as_ref() == Some(&shortcut)
+        && app_handle.global_shortcut().is_registered(shortcut)
+    {
+        return Ok(true);
+    }
+
     match app_handle.global_shortcut().register(shortcut.clone()) {
         Ok(_) => {
-            let _ = app_handle.global_shortcut().unregister(shortcut);
+            app_handle.global_shortcut().unregister(shortcut)
+                .map_err(|error| AppError::Internal(error.to_string()))?;
             Ok(true)
         }
         Err(e) => {

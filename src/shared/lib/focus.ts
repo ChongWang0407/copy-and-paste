@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 
 let focusSessionSequence = 0;
 
@@ -37,23 +36,14 @@ export async function withNativeDialog<T>(
   scope = "native-dialog"
 ): Promise<T> {
   const owner = nextFocusOwner(scope);
-  const currentWindow = getCurrentWindow();
-  let wasAlwaysOnTop = false;
-
   await acquireBlurGuard(owner);
   try {
-    wasAlwaysOnTop = await currentWindow.isAlwaysOnTop().catch(() => false);
-    if (wasAlwaysOnTop) {
-      await currentWindow.setAlwaysOnTop(false).catch(() => {});
-    }
-
+    await invoke("set_panel_lowered", { owner, lowered: true });
     await activateForNativeDialog().catch(() => {});
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     return await action();
   } finally {
-    if (wasAlwaysOnTop) {
-      await currentWindow.setAlwaysOnTop(true).catch(() => {});
-    }
+    await invoke("set_panel_lowered", { owner, lowered: false }).catch(console.error);
     await focusClipboardWindow().catch(() => {});
     await releaseBlurGuard(owner).catch(() => {});
   }

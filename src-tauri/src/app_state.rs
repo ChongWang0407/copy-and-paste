@@ -1,4 +1,5 @@
 use crate::domain::models::ClipboardEntry;
+use crate::infrastructure::macos_api::window::WindowPinMode;
 use crate::services::encryption_queue::EncryptionQueue;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,6 +24,7 @@ pub struct SettingsState {
     pub main_hotkey: Mutex<String>,
     /// `follow_mouse` | `last` | `fixed`
     pub window_position_mode: Mutex<String>,
+    pub window_pin_mode: Mutex<WindowPinMode>,
     /// 0 (clearest) – 100 (most tinted).
     pub glass_level: AtomicU64,
     /// 复制提示弹窗: the pill that pops up at the top of the screen on each copy.
@@ -53,6 +55,7 @@ impl SettingsState {
             arrow_key_selection,
             main_hotkey,
             window_position_mode,
+            window_pin_mode,
             glass_level,
             capsule_enabled,
             capsule_style,
@@ -73,6 +76,7 @@ impl SettingsState {
         self.arrow_key_selection.store(arrow_key_selection.into_inner(), Ordering::Relaxed);
         *self.main_hotkey.lock().unwrap() = main_hotkey.into_inner().unwrap();
         *self.window_position_mode.lock().unwrap() = window_position_mode.into_inner().unwrap();
+        *self.window_pin_mode.lock().unwrap() = window_pin_mode.into_inner().unwrap();
         self.glass_level.store(glass_level.into_inner(), Ordering::Relaxed);
         self.capsule_enabled.store(capsule_enabled.into_inner(), Ordering::Relaxed);
         *self.capsule_style.lock().unwrap() = capsule_style.into_inner().unwrap();
@@ -101,6 +105,7 @@ pub struct EncryptionQueueState(pub EncryptionQueue);
 #[cfg(test)]
 mod tests {
     use crate::app::setup::{load_settings, settings_state_from};
+    use crate::infrastructure::macos_api::window::{WindowPinMode, PIN_MODE_KEY};
     use crate::infrastructure::repository::settings_repo::{SettingsRepository, SqliteSettingsRepository};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
@@ -115,8 +120,10 @@ mod tests {
         repo.set("app.delete_after_paste", "true").unwrap();
         repo.set("app.cleanup_rules", "secret => ").unwrap();
         repo.set("app.hotkey", "Ctrl+Shift+K").unwrap();
+        repo.set(PIN_MODE_KEY, "normal").unwrap();
         let running = settings_state_from(&load_settings(&repo));
         assert!(running.delete_after_paste.load(Ordering::Relaxed));
+        assert_eq!(*running.window_pin_mode.lock().unwrap(), WindowPinMode::Normal);
 
         repo.clear().unwrap();
         running.take_values_from(settings_state_from(&load_settings(&repo)));
@@ -124,5 +131,6 @@ mod tests {
         assert!(!running.delete_after_paste.load(Ordering::Relaxed));
         assert_eq!(*running.cleanup_rules.lock().unwrap(), *defaults.cleanup_rules.lock().unwrap());
         assert_eq!(*running.main_hotkey.lock().unwrap(), *defaults.main_hotkey.lock().unwrap());
+        assert_eq!(*running.window_pin_mode.lock().unwrap(), WindowPinMode::AlwaysOnTop);
     }
 }

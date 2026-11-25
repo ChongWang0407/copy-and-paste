@@ -59,19 +59,22 @@ export const useSidePanel = () => {
     // it keeps its width until the window is narrow again.
     setPanel({ kind: null, listWidth: baseWidth });
     closingWidthRef.current = baseWidth;
+    let timer: number | null = null;
     const finish = () => {
       window.removeEventListener("resize", onResize);
-      window.clearTimeout(timer);
+      if (timer !== null) window.clearTimeout(timer);
       settleRef.current = null;
       setPanel((current) => (current.kind === null ? CLOSED : current));
     };
     const onResize = () => {
       if (window.innerWidth <= baseWidth + 1) finish();
     };
-    const timer = window.setTimeout(finish, CLOSE_SETTLE_MAX_MS);
     window.addEventListener("resize", onResize);
     settleRef.current = finish;
     await invoke("set_side_panel", { extra: null }).catch(console.error);
+    if (settleRef.current !== finish) return;
+    if (window.innerWidth <= baseWidth + 1) finish();
+    else timer = window.setTimeout(finish, CLOSE_SETTLE_MAX_MS);
   }, []);
 
   useEffect(() => {

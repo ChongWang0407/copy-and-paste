@@ -108,6 +108,7 @@ export default function PermissionOnboarding({ ready, t, onboardingDone, onDone,
       await invoke("set_panel_lowered", { lowered: true });
       await permission.request();
     } catch {
+      stopAuthorizing();
       pushToast(t("accessibility_settings_failed"), 4000);
     }
   };

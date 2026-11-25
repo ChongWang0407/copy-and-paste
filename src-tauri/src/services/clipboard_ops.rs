@@ -568,7 +568,6 @@ async fn handle_window_focus_for_paste(app_handle: &tauri::AppHandle) -> AppResu
         crate::infrastructure::macos_api::window::set_window_focusable(&window, false);
         if !window_pinned {
             crate::app::window_manager::before_hide(app_handle);
-            let _ = window.set_always_on_top(false);
             let _ = crate::infrastructure::macos_api::window::hide_clipboard_panel(app_handle);
         }
     }

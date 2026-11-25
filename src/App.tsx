@@ -28,19 +28,22 @@ import { useFocusCoordinator } from "./shared/hooks/useFocusCoordinator";
 import { isTextEntry, type TypeFilter } from "./shared/lib/clipboardTypes";
 import { showNativeMenu, type NativeMenuItem } from "./shared/lib/nativeMenu";
 import { isTauriRuntime } from "./shared/lib/tauriRuntime";
-import type { ClipboardEntry } from "./shared/types";
+import type { ClipboardEntry, WindowPinMode } from "./shared/types";
 
 /** How much the CSS tint shows on systems with frosted glass only. */
 const FROSTED_TINT_MAX = 0.72;
 /** Longer than the side panel's animation, so its in-between widths aren't saved. */
 const WINDOW_SIZE_SAVE_DELAY_MS = 500;
+const PIN_MODE_KEY = "app.window_pin_mode";
+
+const normalizePinMode = (value?: string): WindowPinMode => value === "normal" ? "normal" : "always_on_top";
 
 const App = () => {
   useFocusCoordinator();
   useContextMenuBlock();
 
   const settings = useSettings();
-  const { t, flag, values, ready, save } = settings;
+  const { t, flag, values, ready, save, remember } = settings;
   const { toasts, pushToast, confirmDialog, openConfirm, closeConfirm } = useOverlays(t);
 
   const [showSettings, setShowSettings] = useState(false);
@@ -49,6 +52,15 @@ const App = () => {
   const [typeFilter, setTypeFilter] = useState<TypeFilter | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [isWindowPinned, setIsWindowPinned] = useState(false);
+  const pinMode = normalizePinMode(values[PIN_MODE_KEY]);
+  const pinModeRef = useRef(pinMode);
+  useEffect(() => { pinModeRef.current = pinMode; }, [pinMode]);
+  const windowPinnedRef = useRef(isWindowPinned);
+  const pinModeChange = useRef(Promise.resolve());
+  const updateWindowPinned = useCallback((pinned: boolean) => {
+    windowPinnedRef.current = pinned;
+    setIsWindowPinned(pinned);
+  }, []);
   const [settingFixedPosition, setSettingFixedPosition] = useState(false);
   const [editing, setEditing] = useState<ClipboardEntry | null>(null);
   const [batchItems, setBatchItems] = useState<ClipboardEntry[]>([]);
@@ -301,17 +313,15 @@ const App = () => {
     onClose: hidePreview,
   });
 
-  // The window opens at the size it was left at. While a side panel is open
-  // the width isn't the user's (the native panel swallows Tauri's resize events,
-  // so this listens to the page).
-  const sidePanelOpen = panel.kind !== null;
+  // The list keeps its own width while the side panel opens or shrinks away.
+  const sidePanelResizingWindow = panel.listWidth !== null;
   useEffect(() => {
     if (!isTauriRuntime() || !ready) return;
     let timer: number | null = null;
     const onResize = () => {
       if (timer !== null) window.clearTimeout(timer);
       timer = window.setTimeout(() => {
-        if (sidePanelOpen) return;
+        if (sidePanelResizingWindow) return;
         const width = String(Math.round(window.innerWidth));
         const height = String(Math.round(window.innerHeight));
         invoke("save_setting", { key: "app.window_logical_width", value: width }).catch(console.error);
@@ -323,7 +333,7 @@ const App = () => {
       if (timer !== null) window.clearTimeout(timer);
       window.removeEventListener("resize", onResize);
     };
-  }, [ready, sidePanelOpen]);
+  }, [ready, sidePanelResizingWindow]);
 
   // The selection follows the list, not a stale index.
   useEffect(() => {
@@ -339,9 +349,11 @@ const App = () => {
         setSelectedIndex(null);
         listRef.current?.scrollToTop();
       }),
-      listen<boolean>("window-pinned-changed", ({ payload }) => setIsWindowPinned(payload)),
+      listen<boolean>("window-pinned-changed", ({ payload }) => updateWindowPinned(payload)),
       // A close (hotkey, red button) was refused because the window is pinned.
-      listen("window-pinned-close-blocked", () => pushToastRef.current(tRef.current("pinned_esc_hint"))),
+      listen("window-pinned-close-blocked", () => {
+        if (pinModeRef.current === "always_on_top") pushToastRef.current(tRef.current("pinned_esc_hint"));
+      }),
       listen("side-panel-collapsed", () => {
         setEditing(null);
         setBatchItems([]);
@@ -351,7 +363,7 @@ const App = () => {
     return () => {
       subscriptions.forEach((subscription) => void subscription.then((off) => off()));
     };
-  }, []);
+  }, [updateWindowPinned]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -371,11 +383,32 @@ const App = () => {
     [glassLevel, hasNativeGlass]
   );
 
+  const showPinnedToast = (mode: WindowPinMode) =>
+    pushToast(t(mode === "normal" ? "pinned_normal_hint" : "pinned_esc_hint"));
+
   const togglePinned = () => {
-    const next = !isWindowPinned;
-    setIsWindowPinned(next);
-    invoke("set_window_pinned", { pinned: next }).catch(console.error);
-    if (next) pushToast(t("pinned_esc_hint"));
+    const pinned = !windowPinnedRef.current;
+    updateWindowPinned(pinned);
+    invoke("set_window_pinned", { pinned }).catch(console.error);
+    if (pinned) showPinnedToast(pinModeRef.current);
+  };
+
+  const selectPinMode = (mode: WindowPinMode, fromHeader: boolean) => {
+    pinModeChange.current = pinModeChange.current.then(async () => {
+      const changed = mode !== pinModeRef.current;
+      if (changed) {
+        await invoke("set_window_pin_mode", { mode });
+        pinModeRef.current = mode;
+        remember(PIN_MODE_KEY, mode);
+      }
+      if (!fromHeader) return;
+      const shouldPin = !windowPinnedRef.current;
+      if (shouldPin) {
+        await invoke("set_window_pinned", { pinned: true });
+        updateWindowPinned(true);
+      }
+      if (shouldPin || changed) showPinnedToast(mode);
+    }).catch((error) => pushToast(t("save_failed") + String(error), 3000));
   };
 
   const clearHistory = () => {
@@ -442,11 +475,13 @@ const App = () => {
           displayName={displayNameOf(values)}
           showSettings={showSettings}
           isWindowPinned={isWindowPinned}
+          pinMode={pinMode}
           favoritesOpen={panel.kind === "favorites"}
           onBack={leaveSettings}
           onToggleFavorites={toggleFavorites}
           onTogglePinned={togglePinned}
-          onPinnedCloseAttempt={() => pushToast(t("pinned_esc_hint"))}
+          onSelectPinMode={(mode) => selectPinMode(mode, true)}
+          onCloseWindow={() => void invoke("hide_window_cmd").catch(console.error)}
           onClearHistory={clearHistory}
           onOpenSettings={() => {
             closeSidePanel();
@@ -457,6 +492,8 @@ const App = () => {
         {showSettings ? (
           <SettingsPage
             settings={settings}
+            pinMode={pinMode}
+            onSelectPinMode={(mode) => selectPinMode(mode, false)}
             pushToast={pushToast}
             onSetFixedPosition={beginFixedPosition}
             onResetSettings={resetSettings}

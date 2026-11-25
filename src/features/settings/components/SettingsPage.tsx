@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ask, message, open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -12,12 +12,11 @@ import { chosenApp, unchosenFallback } from "../utils/defaultApps";
 import type { InstalledAppOption } from "../types";
 import type { SettingsStore } from "../../app/useSettings";
 import { displayNameOf } from "../../app/useSettings";
-import type { Locale } from "../../../shared/types";
+import type { Locale, WindowPinMode } from "../../../shared/types";
 import { withNativeDialog } from "../../../shared/lib/focus";
 import { formatError } from "../../../shared/lib/errorMessage";
 import { requestMacAccessibility } from "../../../shared/lib/macAccessibility";
 import { clampDisplayName } from "../../../shared/lib/displayName";
-import { isTypingHotkey } from "../../../shared/lib/hotkeyKey";
 import { GITHUB_URL, WEBSITE_URL } from "../../../shared/config";
 import { ACCENTS, ACCENT_NAMES, ACCENT_SETTING_KEY, normalizeAccent } from "../../../shared/lib/accent";
 
@@ -35,6 +34,8 @@ const appDisplayName = (path: string) => (path.split(/[/\\]/).pop() || path).rep
 
 interface SettingsPageProps {
   settings: SettingsStore;
+  pinMode: WindowPinMode;
+  onSelectPinMode: (mode: WindowPinMode) => void;
   pushToast: (message: string, duration?: number) => void;
   /** The window stays open while the user drags it to its fixed position. */
   onSetFixedPosition: () => void;
@@ -44,6 +45,8 @@ interface SettingsPageProps {
 
 const SettingsPage = ({
   settings,
+  pinMode,
+  onSelectPinMode,
   pushToast,
   onSetFixedPosition,
   onResetSettings,
@@ -94,34 +97,19 @@ const SettingsPage = ({
 
   const hotkey = values["app.hotkey"] ?? "";
 
-  const hotkeyIsFree = useCallback(
-    async (next: string, allowTyping: boolean, other: { hotkey: string; name: string }) => {
-      if (!next) return true;
-      if (!allowTyping && isTypingHotkey(next)) {
-        pushToast(t("hotkey_needs_modifier"), 4000);
-        return false;
-      }
-      if (next === other.hotkey) {
-        pushToast(t("hotkey_conflict").replace("{name}", other.name), 4000);
-        return false;
-      }
-      try {
-        await invoke("test_hotkey_available", { hotkey: next, allowTyping });
-        return true;
-      } catch (error) {
-        pushToast(`${next}: ${formatError(error, t) || t("hotkey_occupied")}`, 4000);
-        return false;
-      }
-    },
-    [pushToast, t]
-  );
-
   const recordWakeHotkey = async (next: string) => {
-    if (!(await hotkeyIsFree(next, true, { hotkey: "", name: "" }))) return;
-    save("app.hotkey", next);
-    invoke("register_hotkey", { hotkey: next }).catch((error) => {
-      if (next) pushToast(t("hotkey_register_failed") + String(error), 3000);
-    });
+    try {
+      await invoke("test_hotkey_available", { hotkey: next, allowTyping: true });
+    } catch (error) {
+      pushToast(`${next}: ${formatError(error, t) || t("hotkey_occupied")}`, 4000);
+      return;
+    }
+    try {
+      await invoke("register_hotkey", { hotkey: next });
+      remember("app.hotkey", next);
+    } catch (error) {
+      pushToast(t("hotkey_register_failed") + String(error), 3000);
+    }
   };
 
   const applyToggle = (key: string, value: boolean, command: string, args: Record<string, unknown>) => {
@@ -216,7 +204,7 @@ const SettingsPage = ({
     <div className="settings-page">
       <Section title={t("section_common")} open={!!openSections.common} onToggle={() => toggleSection("common")}>
         <Row label={t("wake_hotkey")} subtitle={t("hotkey_click_hint")}>
-          <HotkeyField t={t} value={hotkey} label={t("wake_hotkey")} onRecorded={(next) => void recordWakeHotkey(next)} />
+          <HotkeyField t={t} value={hotkey} label={t("wake_hotkey")} onRecorded={recordWakeHotkey} />
         </Row>
         <Row label={t("autostart")} hint={t("autostart_hint")}>
           <Toggle
@@ -250,6 +238,16 @@ const SettingsPage = ({
               {t("window_position_reset")}
             </button>
           )}
+        </Row>
+        <Row label={t("window_pin_mode")} hint={t("window_pin_mode_hint")} column>
+          <Segmented<WindowPinMode>
+            value={pinMode}
+            onChange={onSelectPinMode}
+            options={[
+              { value: "always_on_top", label: t("pin_mode_always_on_top") },
+              { value: "normal", label: t("pin_mode_normal") },
+            ]}
+          />
         </Row>
         <Row label={t("hide_tray_icon")} hint={t("hide_tray_icon_hint")}>
           <Toggle
