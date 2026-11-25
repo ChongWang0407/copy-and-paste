@@ -48,6 +48,24 @@ fn default_true() -> bool {
     true
 }
 
+/// Identifies a capture even when SQLite reuses a deleted row's ID.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryIdentity {
+    pub id: i64,
+    pub created_at: i64,
+}
+
+impl EntryIdentity {
+    pub fn from_entry(entry: &ClipboardEntry) -> Self {
+        Self { id: entry.id, created_at: entry.created_at }
+    }
+
+    pub fn matches(self, entry: &ClipboardEntry) -> bool {
+        self == Self::from_entry(entry)
+    }
+}
+
 /// The content a background job read, independent of pinning and paste order.
 #[derive(Clone)]
 pub(crate) struct EntryVersion {
@@ -58,6 +76,10 @@ pub(crate) struct EntryVersion {
 }
 
 impl EntryVersion {
+    pub fn identity(&self) -> EntryIdentity {
+        EntryIdentity { id: self.id, created_at: self.created_at }
+    }
+
     pub fn from_entry(entry: &ClipboardEntry) -> Self {
         Self {
             id: entry.id,

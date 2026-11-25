@@ -391,6 +391,20 @@ pub fn migrate_legacy_ciphertexts(conn: &rusqlite::Connection) -> Result<usize, 
     migrate_legacy_inner(conn).map_err(|e| e.to_string())
 }
 
+fn write_upgraded_history(
+    conn: &rusqlite::Connection,
+    entry: crate::domain::models::EntryIdentity,
+    content: &str,
+    preview: &str,
+    html: Option<&str>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE clipboard_history SET content = ?1, preview = ?2, html_content = ?3
+         WHERE id = ?4 AND created_at = ?5",
+        rusqlite::params![content, preview, html, entry.id, entry.created_at],
+    )
+}
+
 fn migrate_legacy_inner(conn: &rusqlite::Connection) -> Result<usize, Box<dyn std::error::Error>> {
     const MIGRATION: &str = "legacy-encryption-v1";
     if conn.query_row("SELECT EXISTS(SELECT 1 FROM fork_migrations WHERE name = ?)", [MIGRATION], |row| row.get::<_, bool>(0))? {
@@ -410,16 +424,16 @@ fn migrate_legacy_inner(conn: &rusqlite::Connection) -> Result<usize, Box<dyn st
     };
     let history = {
         let mut stmt = conn.prepare(
-            "SELECT id, content, preview, html_content FROM clipboard_history
+            "SELECT id, content, preview, html_content, created_at FROM clipboard_history
              WHERE content GLOB 'plain:*' OR preview GLOB 'plain:*' OR html_content GLOB 'plain:*'
                 OR content GLOB 'dpapi:*' OR preview GLOB 'dpapi:*' OR html_content GLOB 'dpapi:*'",
         )?;
         let mut rows = stmt.query([])?;
         let mut pending = Vec::new();
         while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
+            let entry = crate::domain::models::EntryIdentity { id: row.get(0)?, created_at: row.get(4)? };
             let html: Option<String> = row.get(3)?;
-            pending.push((id, upgrade_field(row.get(1)?)?, upgrade_field(row.get(2)?)?, html.map(upgrade_field).transpose()?));
+            pending.push((entry, upgrade_field(row.get(1)?)?, upgrade_field(row.get(2)?)?, html.map(upgrade_field).transpose()?));
         }
         pending
     };
@@ -430,9 +444,10 @@ fn migrate_legacy_inner(conn: &rusqlite::Connection) -> Result<usize, Box<dyn st
     for (key, value) in &settings {
         tx.execute("UPDATE settings SET value = ?1 WHERE key = ?2", rusqlite::params![value, key])?;
     }
-    for (id, content, preview, html) in &history {
-        tx.execute("UPDATE clipboard_history SET content = ?1, preview = ?2, html_content = ?3 WHERE id = ?4",
-            rusqlite::params![content, preview, html, id])?;
+    for (entry, content, preview, html) in &history {
+        if write_upgraded_history(&tx, *entry, content, preview, html.as_deref())? != 1 {
+            return Err("Clipboard history changed during encryption migration".into());
+        }
     }
     tx.execute("INSERT INTO fork_migrations (name) VALUES (?)", [MIGRATION])?;
     tx.commit()?;
@@ -613,5 +628,26 @@ mod tests {
         let legacy = format!("{LEGACY_DPAPI_PREFIX}{encoded}");
         let modern = encrypt_value(&legacy).expect("wrap legacy value");
         assert_eq!(decrypt_value(&modern).as_deref(), Some("old-secret"));
+    }
+
+    #[test]
+    fn legacy_upgrade_skips_an_entry_replaced_before_writeback() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::infrastructure::repository::migrations::run_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO clipboard_history (content_type, content, source_app, timestamp, created_at, preview)
+             VALUES ('text', 'replacement', 'Notes', 20, 20, 'replacement');",
+        ).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let original = crate::domain::models::EntryIdentity { id: 1, created_at: 10 };
+        assert_eq!(
+            write_upgraded_history(&tx, original, "upgraded", "preview", None).unwrap(),
+            0
+        );
+        tx.commit().unwrap();
+        let content: String = conn
+            .query_row("SELECT content FROM clipboard_history WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content, "replacement");
     }
 }

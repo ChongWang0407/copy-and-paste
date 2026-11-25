@@ -3,7 +3,7 @@ import { Reorder, useDragControls } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronUp, FileText, GripVertical, Play, Trash2, X } from "lucide-react";
 import type { ClipboardEntry, Translate } from "../../shared/types";
-import { isTextEntry } from "../../shared/lib/clipboardTypes";
+import { entryKey, isTextEntry } from "../../shared/lib/clipboardTypes";
 import { useImageThumbnail, useVideoThumbnail } from "../../shared/hooks/useImageThumbnail";
 import { showNativeMenu, type NativeMenuItem } from "../../shared/lib/nativeMenu";
 import { startWindowDrag } from "../../shared/lib/windowDrag";
@@ -167,7 +167,7 @@ const BatchPanel = ({
           id: item.id,
           contentType: item.content_type,
           text: isTextEntry(item.content_type)
-            ? await invoke<string>("get_clipboard_content", { id: item.id }).catch((error) => {
+            ? await invoke<string>("get_clipboard_content", { ...entryKey(item) }).catch((error) => {
                 throw new Error(`${CONTENT_UNAVAILABLE}: ${String(error)}`);
               })
             : "",
@@ -175,7 +175,7 @@ const BatchPanel = ({
       );
       await invoke("paste_batch", {
         segments: buildBatchSegments(full, connector),
-        sourceIds: localOrder.map((item) => item.id),
+        sources: localOrder.map(entryKey),
         deleteAfterUse: deleteAfterPaste,
         moveToTop: moveToTopAfterPaste,
       });

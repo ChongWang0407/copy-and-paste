@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ClipboardEntry, Translate } from "../../shared/types";
-import { isTextEntry } from "../../shared/lib/clipboardTypes";
+import { entryKey, isTextEntry } from "../../shared/lib/clipboardTypes";
 
 /** Files and media are read by id on the backend; sending their content is waste. */
 const contentFor = (entry: ClipboardEntry) => (isTextEntry(entry.content_type) ? entry.content : "");
@@ -63,13 +63,13 @@ export const usePasteActions = ({ t, pushToast, deleteAfterPaste, moveToTopAfter
       const { deleteAfterUse, moveToTop } = afterUse(entry);
       try {
         if (format === "markdown") {
-          await invoke("paste_entry_as_markdown", { id: entry.id, deleteAfterUse, moveToTop });
+          await invoke("paste_entry_as_markdown", { ...entryKey(entry), deleteAfterUse, moveToTop });
         } else {
           await invoke("copy_to_clipboard", {
             content: contentFor(entry),
             contentType: entry.content_type,
             paste: true,
-            id: entry.id,
+            ...entryKey(entry),
             deleteAfterUse,
             pasteWithFormat: format === "original",
             moveToTop,
@@ -86,7 +86,7 @@ export const usePasteActions = ({ t, pushToast, deleteAfterPaste, moveToTopAfter
   const pasteImageText = useCallback(
     async (entry: ClipboardEntry) => {
       try {
-        await invoke("paste_image_text", { id: entry.id, ...afterUse(entry) });
+      await invoke("paste_image_text", { ...entryKey(entry), ...afterUse(entry) });
         afterPaste();
       } catch (error) {
         failed(error);

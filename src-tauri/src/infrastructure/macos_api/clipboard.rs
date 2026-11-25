@@ -548,20 +548,24 @@ mod tests {
 
     #[test]
     #[ignore = "requires a GUI session with access to the macOS pasteboard server"]
-    fn native_write_marks_its_change_but_leaves_the_next_copy_visible() {
+    fn a_new_copy_of_the_same_text_has_its_own_change_count() {
         use objc2_app_kit::NSPasteboardItem;
         autoreleasepool(|_| {
             let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+            let write_text = || {
+                let item = NSPasteboardItem::new();
+                assert!(unsafe {
+                    item.setString_forType(&NSString::from_str("same text"), NSPasteboardTypeString)
+                });
+                assert!(pasteboard.writeObjects(&NSArray::from_retained_slice(&[
+                    ProtocolObject::from_retained(item),
+                ])));
+            };
             clear_for_own_write(&pasteboard);
-            let item = NSPasteboardItem::new();
-            assert!(unsafe {
-                item.setString_forType(&NSString::from_str("text"), NSPasteboardTypeString)
-            });
-            assert!(pasteboard.writeObjects(&NSArray::from_retained_slice(&[
-                ProtocolObject::from_retained(item)
-            ])));
+            write_text();
             assert!(is_own_change(pasteboard.changeCount()));
             pasteboard.clearContents();
+            write_text();
             assert!(!is_own_change(pasteboard.changeCount()));
         });
     }

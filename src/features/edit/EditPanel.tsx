@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ClipboardEntry, Translate } from "../../shared/types";
+import { entryKey } from "../../shared/lib/clipboardTypes";
 import { startWindowDrag } from "../../shared/lib/windowDrag";
 
 interface EditPanelProps {
@@ -24,6 +25,7 @@ const EditPanel = ({
   onClose,
 }: EditPanelProps) => {
   const [text, setText] = useState<string | null>(null);
+  const { id, createdAt } = entryKey(entry);
 
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
@@ -36,7 +38,7 @@ const EditPanel = ({
     let alive = true;
     // The list holds a shortened copy of long entries. Without the full text
     // there is nothing to edit: saving the copy would cut the entry short.
-    invoke<string>("get_clipboard_content", { id: entry.id })
+    invoke<string>("get_clipboard_content", { id, createdAt })
       .then((full) => {
         if (alive) setText(full);
       })
@@ -49,10 +51,10 @@ const EditPanel = ({
     return () => {
       alive = false;
     };
-  }, [entry.id]);
+  }, [id, createdAt]);
 
   const fail = (error: unknown) => pushToast(t("save_failed") + String(error), 3000);
-  const save = () => invoke("update_item_content", { id: entry.id, newContent: text ?? "" });
+  const save = () => invoke("update_item_content", { id, createdAt, newContent: text ?? "" });
 
   const empty = !text || !text.trim();
 
@@ -80,7 +82,7 @@ const EditPanel = ({
               .then(() =>
                 invoke("paste_text", {
                   text,
-                  sourceId: entry.id,
+                  source: { id, createdAt },
                   deleteAfterUse: deleteAfterPaste && !entry.is_pinned,
                   moveToTop: moveToTopAfterPaste,
                 })

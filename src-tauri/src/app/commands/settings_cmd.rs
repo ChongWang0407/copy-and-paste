@@ -24,8 +24,6 @@ pub fn set_sequential_mode(
         let mut queue = paste_queue.inner().0.lock().unwrap();
         queue.items.clear();
         queue.last_action_was_paste = false;
-        queue.last_pasted_content = None;
-        queue.last_pasted_fingerprint = None;
     }
 
     let _ = sync_registered_hotkeys(&app_handle);

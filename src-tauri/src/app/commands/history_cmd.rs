@@ -1,6 +1,6 @@
 use crate::app_state::{AppDataDir, PasteQueue, SessionHistory};
 use crate::database::DbState;
-use crate::domain::models::ClipboardEntry;
+use crate::domain::models::{ClipboardEntry, EntryIdentity};
 use crate::error::{AppError, AppResult};
 use crate::infrastructure::repository::clipboard_repo::{
     matches_type, ClipboardRepository, ClipboardSortMode, ConfirmedEntry, SqliteClipboardRepository,
@@ -461,13 +461,19 @@ pub fn delete_clipboard_entry(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
     app_data: State<'_, AppDataDir>,
+    paste_queue: State<'_, PasteQueue>,
     id: i64,
+    created_at: i64,
 ) -> AppResult<()> {
+    let identity = EntryIdentity { id, created_at };
     if id > 0 {
         let data_dir = app_data.0.lock().unwrap().clone();
-        state.repo.delete(id, Some(&data_dir))?;
+        if !state.repo.delete_if_current(identity, Some(&data_dir))? {
+            return Err(AppError::Validation(SELECTION_CHANGED.into()));
+        }
     }
-    session.0.lock().unwrap().retain(|item| item.id != id);
+    session.0.lock().unwrap().retain(|item| !identity.matches(item));
+    paste_queue.0.lock().unwrap().items.retain(|item| *item != identity);
     crate::services::clipboard::sweep_session_files(&app_handle);
     let _ = app_handle.emit("clipboard-changed", ());
     Ok(())
@@ -510,7 +516,8 @@ pub(crate) fn delete_selection(
     let session_entries = |items: &VecDeque<ClipboardEntry>| items.iter().filter(|entry| entry.id < 0).count();
     let before = session_entries(session);
     // Positive IDs too: a legacy in-memory copy of a stored entry goes with it.
-    session.retain(|entry| !seen.contains(&entry.id));
+    let identities: HashSet<_> = items.iter().map(ConfirmedEntry::identity).collect();
+    session.retain(|entry| !identities.contains(&EntryIdentity::from_entry(entry)));
     deleted += before - session_entries(session);
     Ok(deleted)
 }
@@ -535,10 +542,9 @@ pub fn delete_clipboard_entries(
         let mut session_items = session.0.lock().unwrap();
         delete_selection(&state.repo, &mut session_items, &items, &data_dir)?
     };
-    // The sequential paste queue reads entries by ID too.
     {
-        let ids: HashSet<i64> = items.iter().map(|item| item.id).collect();
-        paste_queue.0.lock().unwrap().items.retain(|id| !ids.contains(id));
+        let identities: HashSet<_> = items.iter().map(ConfirmedEntry::identity).collect();
+        paste_queue.0.lock().unwrap().items.retain(|item| !identities.contains(item));
     }
     crate::services::clipboard::sweep_session_files(&app_handle);
     let _ = app_handle.emit("clipboard-changed", ());
@@ -676,17 +682,20 @@ pub fn get_clipboard_content(
     state: State<'_, DbState>,
     session: State<'_, SessionHistory>,
     id: i64,
+    created_at: Option<i64>,
 ) -> AppResult<String> {
     if id <= 0 {
         let session_items = session.inner().0.lock().unwrap();
-        if let Some(item) = session_items.iter().find(|i| i.id == id) {
+        if let Some(item) = session_items.iter().find(|item| {
+            item.id == id && created_at.is_none_or(|expected| item.created_at == expected)
+        }) {
             return Ok(item.content.clone());
         }
     }
 
     state
         .repo
-        .get_entry_content(id)
+        .get_entry_content_at(id, created_at)
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::Validation("Entry not found".to_string()))
 }

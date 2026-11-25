@@ -1,3 +1,16 @@
+import type { ClipboardEntry } from "../types";
+
+/** SQLite may give a deleted entry's ID to the next copy. */
+export interface EntryKey {
+  id: number;
+  createdAt: number;
+}
+
+export const entryKey = (entry: ClipboardEntry): EntryKey => ({ id: entry.id, createdAt: entry.created_at ?? 0 });
+
+export const isEntry = (entry: ClipboardEntry, key: EntryKey) =>
+  entry.id === key.id && (entry.created_at ?? 0) === key.createdAt;
+
 /** The tabs under the search box, in display order. */
 export const TYPE_FILTERS = ["text", "image", "video", "file", "url", "code"] as const;
 export type TypeFilter = (typeof TYPE_FILTERS)[number];

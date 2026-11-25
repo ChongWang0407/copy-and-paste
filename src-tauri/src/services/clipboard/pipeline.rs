@@ -3,7 +3,7 @@ use crate::database::{
     attachment_extension, calc_image_hash, calc_text_hash, is_text_type, stable_bytes_hash,
     DbState, PendingAttachments,
 };
-use crate::domain::models::{ClipboardEntry, EntryVersion};
+use crate::domain::models::{ClipboardEntry, EntryIdentity, EntryVersion};
 use crate::services::clipboard::utils::*;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -77,7 +77,6 @@ impl ClipboardPipeline {
             stages: vec![
                 Box::new(DiscoveryStage),
                 Box::new(TransformationStage),
-                Box::new(SequentialEchoStage),
                 Box::new(PersistenceStage),
                 Box::new(DistributionStage),
             ],
@@ -342,27 +341,6 @@ fn capture_image(
     entry.is_external = true;
     Some(hash as i64)
 }
-// Stage 3: Sequential paste echo (fast — must run before copy sound)
-pub struct SequentialEchoStage;
-impl PipelineStage for SequentialEchoStage {
-    fn process(&self, ctx: &mut PipelineContext) {
-        let settings = ctx.app_handle.state::<SettingsState>();
-        if !settings.sequential_mode.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let entry = ctx.entry.as_ref().unwrap();
-        let queue_state = ctx.app_handle.state::<PasteQueue>();
-        let queue = queue_state.0.lock().unwrap();
-        if queue.last_action_was_paste
-            && queue.last_pasted_content.as_deref() == Some(&entry.content)
-        {
-            println!("Ignoring echo paste from queue");
-            ctx.should_stop = true;
-        }
-    }
-}
-
 fn duplicate_content_matches(content: &str, kind: &str, html: Option<&str>, old: &str, old_kind: &str, old_html: Option<&str>) -> bool {
     let compatible = kind == old_kind || (is_text_type(kind) && is_text_type(old_kind));
     if !compatible || normalize_clipboard_line_endings(content) != normalize_clipboard_line_endings(old) {
@@ -553,9 +531,8 @@ impl PipelineStage for DistributionStage {
             if queue.last_action_was_paste {
                 queue.items.clear();
                 queue.last_action_was_paste = false;
-                queue.last_pasted_content = None;
             }
-            queue.items.push_back(entry.id);
+            queue.items.push_back(EntryIdentity::from_entry(entry));
         }
 
         // Notify

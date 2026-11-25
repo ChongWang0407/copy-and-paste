@@ -1,4 +1,4 @@
-use crate::domain::models::ClipboardEntry;
+use crate::domain::models::{ClipboardEntry, EntryIdentity};
 use crate::infrastructure::macos_api::window::WindowPinMode;
 use crate::services::encryption_queue::EncryptionQueue;
 use std::collections::VecDeque;
@@ -86,11 +86,8 @@ impl SettingsState {
 
 #[derive(Default)]
 pub struct PasteQueueState {
-    pub items: VecDeque<i64>,
+    pub items: VecDeque<EntryIdentity>,
     pub last_action_was_paste: bool,
-    pub last_pasted_content: Option<String>,
-    pub last_pasted_fingerprint: Option<String>,
-    pub last_paste_timestamp_ms: u64,
 }
 
 #[derive(Default)]

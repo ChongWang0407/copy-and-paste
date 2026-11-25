@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { ClipboardEntry } from "../../shared/types";
-import { entryMatchesType, type TypeFilter } from "../../shared/lib/clipboardTypes";
+import { entryMatchesType, isEntry, type EntryKey, type TypeFilter } from "../../shared/lib/clipboardTypes";
 import { isTauriRuntime } from "../../shared/lib/tauriRuntime";
 import { appendPage, compareEntries, insertEntry, refreshCount, removeEntries } from "./historyList";
 
@@ -114,7 +114,13 @@ export const useHistory = (search: string, typeFilter: TypeFilter | null, ready:
 
   /** Rows removed here (an optimistic delete) leave the next page's offset right. */
   const removeItems = useCallback(
-    (ids: Iterable<number>) => commit(removeEntries(listRef.current, ids)),
+    (entries: EntryKey[]) => {
+      const byId = new Map(entries.map((entry) => [entry.id, entry]));
+      commit(listRef.current.filter((entry) => {
+        const removed = byId.get(entry.id);
+        return !removed || !isEntry(entry, removed);
+      }));
+    },
     [commit]
   );
 

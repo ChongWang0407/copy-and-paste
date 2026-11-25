@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowDown } from "lucide-react";
 import type { ClipboardEntry, Translate } from "../../shared/types";
+import { entryKey } from "../../shared/lib/clipboardTypes";
 import { startWindowDrag } from "../../shared/lib/windowDrag";
 import { withNativeDialog } from "../../shared/lib/focus";
 import { translationErrorMessage, type TranslationConfig } from "./config";
@@ -21,6 +22,9 @@ interface TranslatePanelProps {
 const languageName = (t: Translate, language: TranslateLanguage) =>
   t(language === "en" ? "translate_lang_en" : "translate_lang_zh");
 
+export const loadTranslationSource = (id: number, createdAt: number) =>
+  invoke<string>("get_clipboard_content", { id, createdAt });
+
 /** 翻译: 原文 above, 译文 below, both editable. Chinese ↔ English only. */
 const TranslatePanel = ({
   t,
@@ -33,6 +37,7 @@ const TranslatePanel = ({
   onClose,
 }: TranslatePanelProps) => {
   const [source, setSource] = useState<string | null>(null);
+  const { id, createdAt } = entryKey(entry);
   const [result, setResult] = useState("");
   const [direction, setDirection] = useState<TranslateDirection | null>(null);
   const [busy, setBusy] = useState(false);
@@ -71,27 +76,35 @@ const TranslatePanel = ({
   );
   const runOnOpen = useRef(run);
   runOnOpen.current = run;
+  const loadFailure = useRef({ t, pushToast, onClose });
+  loadFailure.current = { t, pushToast, onClose };
 
   useEffect(() => {
     let alive = true;
     // The list holds a shortened copy of long entries.
-    invoke<string>("get_clipboard_content", { id: entry.id })
-      .catch(() => entry.content)
+    loadTranslationSource(id, createdAt)
       .then((full) => {
         if (!alive) return;
         setSource(full);
         void runOnOpen.current(full);
+      })
+      .catch((error) => {
+        if (!alive) return;
+        console.error("Full content failed to load", error);
+        const { t, pushToast, onClose } = loadFailure.current;
+        pushToast(t("content_load_failed"), 3000);
+        onClose();
       });
     return () => {
       alive = false;
       requestRef.current += 1;
     };
-  }, [entry.content, entry.id]);
+  }, [id, createdAt]);
 
   const pasteText = (text: string) =>
     invoke("paste_text", {
       text,
-      sourceId: entry.id,
+      source: { id, createdAt },
       deleteAfterUse: deleteAfterPaste && !entry.is_pinned,
       moveToTop: moveToTopAfterPaste,
     })

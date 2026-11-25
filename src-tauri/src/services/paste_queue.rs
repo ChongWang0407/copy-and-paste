@@ -1,7 +1,10 @@
-use crate::app_state::{AppDataDir, PasteQueue, SessionHistory};
+use crate::app_state::{PasteQueue, SessionHistory};
 use crate::app::commands::hotkey_cmd::sync_registered_hotkeys_on_main_thread;
 use crate::database::DbState;
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
+use crate::services::clipboard_ops::{
+    handle_post_paste_actions, handoff_macos_focus_for_paste, paste_to_target_and_then, PasteTarget,
+};
 use tauri::{Emitter, Manager};
 
 
@@ -30,21 +33,27 @@ async fn paste_next_step_inner(app_handle: tauri::AppHandle) {
         .get_webview_window("main")
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false);
-
-    // 1. Pop item from queue (Scope the lock)
-    let id_opt = {
-        let mut queue = state.inner().0.lock().unwrap();
-        queue.last_action_was_paste = true;
-        queue.items.pop_front()
+    let target = if window_was_visible {
+        PasteTarget::previous_app()
+    } else {
+        PasteTarget::foreground_app()
     };
 
-    if let Some(id) = id_opt {
+    // Keep the queue head until we know whether the target received the keystroke.
+    let source = {
+        let mut queue = state.inner().0.lock().unwrap();
+        queue.last_action_was_paste = true;
+        queue.items.front().copied()
+    };
+
+    if let Some(source) = source {
+        let id = source.id;
         // 2. Get Content (DB Lock acquired here, safe because Queue lock is released)
         let entry_opt = if id < 0 {
             let s = session.inner().0.lock().unwrap();
-            s.iter().find(|i| i.id == id).cloned()
+            s.iter().find(|entry| source.matches(entry)).cloned()
         } else {
-            db_state.repo.get_entry_by_id(id).unwrap_or(None)
+            db_state.repo.get_entry_by_id(id).unwrap_or(None).filter(|entry| source.matches(entry))
         };
 
         if let Some(entry) = entry_opt {
@@ -57,12 +66,6 @@ async fn paste_next_step_inner(app_handle: tauri::AppHandle) {
             let html_content = entry.html_content;
             let is_pinned = entry.is_pinned;
             let has_tags = !entry.tags.is_empty();
-            // CRITICAL: Update last_pasted_content BEFORE modifying clipboard to prevent race condition
-            // where the monitor sees the change before we've marked it as an echo.
-            {
-                let mut queue = state.inner().0.lock().unwrap();
-                queue.last_pasted_content = Some(content.clone());
-            }
 
             // 3. Write content to system clipboard using the same payload logic as normal paste.
             match crate::services::clipboard_ops::prepare_clipboard_payload(
@@ -83,95 +86,53 @@ async fn paste_next_step_inner(app_handle: tauri::AppHandle) {
                     eprintln!(
                         "[ERROR] Failed to prepare clipboard payload for sequential paste: {err}"
                     );
-                    // Item already popped; mark progress so the queue can continue on next step.
+                    // A bad payload is skipped so the queue can continue on the next step.
                     let _ = app_handle.emit("queue-item-pasted", id);
                 }
                 Ok(()) => {
-                    // 4. Focus management before paste keystroke.
-                    //    - If the app window WAS open (user had it open and used it), we need to
-                    //      restore focus to the previous app, because clicking in the app stole it.
-                    //    - If the app window was HIDDEN (pure background hotkey press), focus is
-                    //      already in the target app. Do NOT restore focus as that would move
-                    //      focus to a stale/wrong app and break the paste.
-                    if window_was_visible {
-                        #[cfg(target_os = "macos")]
-                        {
-                            let mut reactivated = false;
-                            let prev_pid = crate::global_state::LAST_ACTIVE_APP_PID
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            if prev_pid != 0 {
-                                reactivated =
-                                    crate::infrastructure::macos_api::apps::activate_app_by_pid(
-                                        prev_pid as i32,
-                                    );
-                            }
-                            if !reactivated {
-                                let prev_app = crate::global_state::get_last_active_app_name();
-                                if !prev_app.is_empty() {
-                                    crate::infrastructure::macos_api::apps::activate_app_by_name(
-                                        &prev_app,
-                                    );
-                                }
-                            }
+                    let delay = match target {
+                        PasteTarget::PreviousApp(pid) => {
+                            handoff_macos_focus_for_paste(pid);
+                            60
                         }
-                        // Wait for focus transfer to complete before sending keystroke
-                        // Reduced from 150ms to 60ms for native activation.
-                        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-                    } else {
-                        // When triggered via global hotkey with the window hidden,
-                        // the event is now fired on ShortcutState::Released.
-                        // However, the OS shortcut system might still have slight jitter.
-                        // A tiny 20ms settle helps ensure the physical key state is completely cleared.
+                        PasteTarget::ForegroundApp(_) => 20,
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+
+                    let result = paste_to_target_and_then(target, async {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    }
 
-                    // 6. Send paste keystroke. If it didn't go out, nothing
-                    //    was pasted: the entry is kept.
-                    let sent = match crate::services::clipboard_ops::send_paste_keystroke() {
-                        Ok(()) => true,
-                        Err(err) => {
-                            eprintln!("[ERROR] Sequential paste keystroke failed: {err}");
-                            false
-                        }
-                    };
-
-                    // Settle time
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-
-                    // 7. Perform deletion if delete_after_paste is enabled
-                    let delete_after_paste = {
                         let settings_state = app_handle.state::<crate::app_state::SettingsState>();
-                        settings_state
+                        let delete_after_paste = settings_state
                             .delete_after_paste
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                    };
+                            .load(std::sync::atomic::Ordering::Relaxed);
 
-                    if !sent {
-                        // Kept, and not counted as used.
-                    } else if delete_after_paste && !is_pinned && !has_tags {
-                        {
-                            let mut s = session.inner().0.lock().unwrap();
-                            if let Some(pos) = s.iter().position(|i| i.id == id) {
-                                s.remove(pos);
+                        let delete = delete_after_paste && !is_pinned && !has_tags;
+                        if id > 0 || delete {
+                            match handle_post_paste_actions(
+                                &app_handle, &db_state, Some(source), delete, Some(false),
+                            ) {
+                                Ok(true) => { let _ = app_handle.emit("clipboard-changed", ()); }
+                                Ok(false) => {}
+                                Err(err) => eprintln!("[ERROR] Sequential paste cleanup failed: {err}"),
                             }
                         }
-
-                        if id > 0 {
-                            let app_data = app_handle.state::<AppDataDir>();
-                            let data_dir = app_data.0.lock().unwrap();
-                            if db_state.repo.delete_after_paste(id, Some(&data_dir)).is_ok() {
-                                let _ = app_handle.emit("clipboard-removed", id);
-                            }
-                        } else {
-                            let _ = app_handle.emit("clipboard-removed", id);
-                        }
-                    } else if id > 0 {
-                        let _ = db_state.repo.increment_use_count(id);
+                        Ok(())
+                    })
+                    .await;
+                    if let Err(err) = result {
+                        eprintln!("[ERROR] Sequential paste keystroke failed: {err}");
+                        return;
                     }
 
                     let _ = app_handle.emit("queue-item-pasted", id);
                 }
             }
+        }
+        let mut queue = state.inner().0.lock().unwrap();
+        // A new copy or disabling the mode may have replaced the queue meanwhile.
+        if queue.last_action_was_paste && queue.items.front() == Some(&source) {
+            queue.items.pop_front();
         }
     } else {
         let _ = app_handle.emit("queue-finished", ());
