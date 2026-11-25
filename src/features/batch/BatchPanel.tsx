@@ -1,17 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Reorder, useDragControls } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronUp, FileText, GripVertical, Play, X } from "lucide-react";
+import { ChevronUp, FileText, GripVertical, Play, Trash2, X } from "lucide-react";
 import type { ClipboardEntry, Translate } from "../../shared/types";
 import { isTextEntry } from "../../shared/lib/clipboardTypes";
 import { useImageThumbnail, useVideoThumbnail } from "../../shared/hooks/useImageThumbnail";
 import { showNativeMenu, type NativeMenuItem } from "../../shared/lib/nativeMenu";
 import { startWindowDrag } from "../../shared/lib/windowDrag";
 import { buildBatchSegments, DEFAULT_CONNECTOR, CONNECTORS, type ConnectorId } from "./joinBatch";
+import { selectionCountText } from "./batchSelection";
+import { CONTENT_UNAVAILABLE } from "../app/usePasteActions";
 
 interface BatchPanelProps {
   t: Translate;
   items: ClipboardEntry[];
+  /** Every entry the list shows is ticked. */
+  allVisibleSelected: boolean;
+  /** 全选 can act: the list shows entries, and the finished result of the current search and tab. */
+  canSelectAll: boolean;
+  /** The list has pages not loaded yet (for 「（已加载）」). */
+  hasMore: boolean;
+  deleting: boolean;
+  onToggleSelectAll: () => void;
+  onDeleteSelected: () => void;
   onReorder: (items: ClipboardEntry[]) => void;
   onRemove: (item: ClipboardEntry) => void;
   deleteAfterPaste: boolean;
@@ -103,6 +114,12 @@ const BatchRow = ({
 const BatchPanel = ({
   t,
   items,
+  allVisibleSelected,
+  canSelectAll,
+  hasMore,
+  deleting,
+  onToggleSelectAll,
+  onDeleteSelected,
   onReorder,
   onRemove,
   deleteAfterPaste,
@@ -143,13 +160,16 @@ const BatchPanel = ({
   const paste = async () => {
     setPasting(true);
     try {
-      // The list holds a shortened copy of long entries.
+      // The list holds a shortened copy of long entries: without every full
+      // text nothing is pasted (nor deleted after paste).
       const full = await Promise.all(
         localOrder.map(async (item) => ({
           id: item.id,
           contentType: item.content_type,
           text: isTextEntry(item.content_type)
-            ? await invoke<string>("get_clipboard_content", { id: item.id }).catch(() => item.content)
+            ? await invoke<string>("get_clipboard_content", { id: item.id }).catch((error) => {
+                throw new Error(`${CONTENT_UNAVAILABLE}: ${String(error)}`);
+              })
             : "",
         }))
       );
@@ -167,10 +187,26 @@ const BatchPanel = ({
     }
   };
 
+  const countText = selectionCountText(t, items.length, hasMore, allVisibleSelected);
+  const busy = pasting || deleting;
+
   return (
     <div className="side-panel-body">
       <div className="panel-title" onMouseDown={startWindowDrag}>
         <h2>{t("batch_title")}</h2>
+        <div className="batch-header-tools">
+          <span className="batch-count" title={countText}>
+            {countText}
+          </span>
+          <button
+            type="button"
+            className="glass-button is-compact"
+            disabled={!canSelectAll || busy}
+            onClick={onToggleSelectAll}
+          >
+            {t(allVisibleSelected ? "batch_deselect_all" : "batch_select_all")}
+          </button>
+        </div>
       </div>
       <div className="panel-fill">
         <div className="batch-preview">
@@ -194,15 +230,30 @@ const BatchPanel = ({
           )}
         </div>
       </div>
-      <div className="panel-actions">
-        <button ref={connectorButton} type="button" className="glass-button" onClick={openConnectorMenu}>
+      <div className="panel-actions batch-panel-actions">
+        <button
+          type="button"
+          className="glass-button is-danger is-compact batch-delete-button"
+          disabled={localOrder.length === 0 || busy}
+          onClick={onDeleteSelected}
+        >
+          <Trash2 size={12} />
+          {t("delete")}
+        </button>
+        <button
+          ref={connectorButton}
+          type="button"
+          className="glass-button"
+          disabled={busy}
+          onClick={openConnectorMenu}
+        >
           {t("batch_connector")}
           <ChevronUp size={13} />
         </button>
         <button
           type="button"
           className="glass-button is-primary"
-          disabled={localOrder.length === 0 || pasting}
+          disabled={localOrder.length === 0 || busy}
           onClick={() => void paste()}
         >
           {t("batch_paste_action")}

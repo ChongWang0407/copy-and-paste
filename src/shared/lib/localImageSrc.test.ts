@@ -1,5 +1,21 @@
 import { describe, expect, test } from "vitest";
-import { assetUrlToFilePath } from "./localImageSrc";
+import { assetUrlToFilePath, toLocalFilePath } from "./localImageSrc";
+
+describe("toLocalFilePath", () => {
+  test("file URLs keep the root of a macOS path", () => {
+    expect(toLocalFilePath("file:///Users/me/a%20b.png")).toBe("/Users/me/a b.png");
+    expect(toLocalFilePath("file://localhost/Users/me/a.png")).toBe("/Users/me/a.png");
+    expect(toLocalFilePath("file:/Users/me/a.png")).toBe("/Users/me/a.png");
+  });
+
+  test("Windows file URLs drop the slash before the drive", () => {
+    expect(toLocalFilePath("file:///C:/Users/me/a.png")).toBe("C:/Users/me/a.png");
+  });
+
+  test("relative file URLs are not local paths", () => {
+    expect(toLocalFilePath("file://server/share/a.png")).toBeNull();
+  });
+});
 
 describe("assetUrlToFilePath", () => {
   test("macOS / Linux asset URL", () => {

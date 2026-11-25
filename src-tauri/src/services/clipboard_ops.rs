@@ -458,25 +458,70 @@ const BATCH_STEP_DELAY_MS: u64 = 350;
 /// Time for the target to read the last step before the clipboard is restored.
 const BATCH_RESTORE_DELAY_MS: u64 = 450;
 
-/// Clears the pause even if a step fails.
+/// Clears the pause even if a step fails. Other owners (hotkey recording)
+/// keep their own hold.
 struct MonitorPause;
 
 impl MonitorPause {
     fn start() -> Self {
-        crate::CLIPBOARD_MONITOR_PAUSED.store(true, Ordering::Relaxed);
+        crate::global_state::pause_clipboard_monitor(crate::global_state::PAUSE_BATCH_PASTE);
         Self
     }
 }
 
 impl Drop for MonitorPause {
     fn drop(&mut self) {
-        crate::CLIPBOARD_MONITOR_PAUSED.store(false, Ordering::Relaxed);
+        crate::global_state::resume_clipboard_monitor(crate::global_state::PAUSE_BATCH_PASTE);
     }
+}
+
+/// One batch step, read and checked before the clipboard is touched.
+struct BatchStep {
+    content: String,
+    content_type: String,
+    html: Option<String>,
+}
+
+fn resolve_batch_steps(
+    app_handle: &tauri::AppHandle,
+    state: &DbState,
+    session: &SessionHistory,
+    segments: Vec<BatchSegment>,
+) -> AppResult<Vec<BatchStep>> {
+    segments
+        .into_iter()
+        .map(|segment| match segment {
+            BatchSegment::Text { text } => Ok(BatchStep {
+                content: text,
+                content_type: "text".to_string(),
+                html: None,
+            }),
+            BatchSegment::Entry { id } => {
+                let (content, content_type, html) = entry_full(app_handle, state, session, id)?;
+                check_payload_files(&content, &content_type)?;
+                Ok(BatchStep { content, content_type, html })
+            }
+        })
+        .collect()
+}
+
+/// Whether the pasteboard still holds the app's latest write: false once the
+/// user (or another app) has copied something newer.
+fn clipboard_still_ours() -> bool {
+    use crate::infrastructure::macos_api::clipboard as native;
+    native::is_own_change(native::change_count())
+}
+
+/// The user's clipboard goes back only over the batch's own write, never over
+/// something copied meanwhile.
+fn should_restore_clipboard(wrote: bool, still_ours: bool) -> bool {
+    wrote && still_ours
 }
 
 /// 批量粘贴: runs the steps in order with one focus hand-off, then puts the
 /// clipboard back. The monitor is paused so no step is recorded as a new
-/// entry. `source_ids` get the usual after-paste actions.
+/// entry. `source_ids` get the usual after-paste actions, only when every
+/// step was pasted.
 #[tauri::command]
 pub async fn paste_batch(
     app_handle: tauri::AppHandle,
@@ -493,36 +538,53 @@ pub async fn paste_batch(
     let _paste_guard = PASTE_LOCK.lock().await;
     require_paste_permission(&app_handle)?;
 
-    let previous_clipboard = capture_clipboard_snapshot();
+    // Every step and the clipboard to put back are checked first: a failure
+    // here leaves the clipboard as it was.
+    let steps = resolve_batch_steps(&app_handle, &state, &session, segments)?;
+    let previous_clipboard = capture_clipboard_snapshot()
+        .ok_or_else(|| AppError::Validation("clipboard_snapshot_failed".to_string()))?;
     let pause = MonitorPause::start();
-    handle_window_focus_for_paste(&app_handle).await?;
 
-    let total = segments.len();
-    for (index, segment) in segments.into_iter().enumerate() {
-        match segment {
-            BatchSegment::Text { text } => {
-                prepare_clipboard_payload(&text, "text", None, false).await?;
+    let mut wrote = false;
+    let result = async {
+        handle_window_focus_for_paste(&app_handle).await?;
+        let total = steps.len();
+        for (index, step) in steps.iter().enumerate() {
+            // The user copied something mid-batch: stop rather than overwrite it.
+            if wrote && !clipboard_still_ours() {
+                return Err(AppError::Validation("clipboard_changed_during_paste".to_string()));
             }
-            BatchSegment::Entry { id } => {
-                let (content, content_type, html) = entry_full(&app_handle, &state, &session, id)?;
-                prepare_clipboard_payload(&content, &content_type, html.as_deref(), html.is_some())
-                    .await?;
+            wrote = true;
+            prepare_clipboard_payload(
+                &step.content,
+                &step.content_type,
+                step.html.as_deref(),
+                step.html.is_some(),
+            )
+            .await?;
+            ensure_paste_target_frontmost().await?;
+            send_paste_keystroke()?;
+            if index + 1 < total {
+                tokio::time::sleep(std::time::Duration::from_millis(BATCH_STEP_DELAY_MS)).await;
             }
         }
-        ensure_paste_target_frontmost().await;
-        send_paste_keystroke();
-        if index + 1 < total {
-            tokio::time::sleep(std::time::Duration::from_millis(BATCH_STEP_DELAY_MS)).await;
-        }
+        hide_window_after_paste(&app_handle).await;
+        Ok(())
     }
+    .await;
 
-    hide_window_after_paste(&app_handle).await;
-    tokio::time::sleep(std::time::Duration::from_millis(BATCH_RESTORE_DELAY_MS)).await;
-    if let Some(snapshot) = previous_clipboard {
-        crate::infrastructure::macos_api::clipboard::restore_pasteboard(&snapshot)
-            .map_err(AppError::Internal)?;
+    // Every exit path puts the clipboard back.
+    let mut restored = Ok(());
+    if wrote {
+        tokio::time::sleep(std::time::Duration::from_millis(BATCH_RESTORE_DELAY_MS)).await;
+        if should_restore_clipboard(wrote, clipboard_still_ours()) {
+            restored = crate::infrastructure::macos_api::clipboard::restore_pasteboard(&previous_clipboard)
+                .map_err(AppError::Internal);
+        }
     }
     drop(pause);
+    result?;
+    restored?;
 
     for id in source_ids {
         handle_post_paste_actions(
@@ -604,11 +666,42 @@ fn handoff_macos_focus_for_paste() -> bool {
     crate::infrastructure::macos_api::apps::activate_app_by_name(&prev_app)
 }
 
-#[cfg(target_os = "macos")]
-fn macos_previous_app_is_frontmost() -> bool {
-    let prev_pid = crate::global_state::LAST_ACTIVE_APP_PID.load(Ordering::Relaxed);
-    prev_pid != 0
-        && crate::infrastructure::macos_api::window::get_active_app_snapshot().pid == prev_pid
+/// The local files a media entry pastes, or None when its content is not a
+/// list of absolute paths (image data, a plain text fallback).
+fn payload_file_paths(content: &str, content_type: &str) -> Option<Vec<String>> {
+    if !matches!(content_type, "image" | "video" | "file") || content.starts_with("data:") {
+        return None;
+    }
+    let file_paths = content
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!file_paths.is_empty()
+        && file_paths
+            .iter()
+            .all(|path| std::path::Path::new(path).is_absolute()))
+    .then_some(file_paths)
+}
+
+const IMAGE_FILE_MISSING: &str = "图片文件已不存在，无法粘贴。";
+const FILES_MISSING: &str = "这些文件都已不存在，无法粘贴。";
+
+/// The same missing-file checks `prepare_clipboard_payload` makes, without
+/// writing anything: a batch checks every step before its first write.
+fn check_payload_files(content: &str, content_type: &str) -> AppResult<()> {
+    let Some(paths) = payload_file_paths(content, content_type) else {
+        return Ok(());
+    };
+    if content_type == "image" {
+        if !std::path::Path::new(&paths[0]).is_file() {
+            return Err(AppError::Validation(IMAGE_FILE_MISSING.to_string()));
+        }
+    } else if !paths.iter().any(|path| std::path::Path::new(path).exists()) {
+        return Err(AppError::Validation(FILES_MISSING.to_string()));
+    }
+    Ok(())
 }
 
 pub async fn prepare_clipboard_payload(
@@ -619,24 +712,13 @@ pub async fn prepare_clipboard_payload(
 ) -> AppResult<()> {
     match content_type {
         "image" | "video" | "file" => {
-            let file_paths = content
-                .lines()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            let is_file_path_payload = !content.starts_with("data:")
-                && !file_paths.is_empty()
-                && file_paths
-                    .iter()
-                    .all(|path| std::path::Path::new(path).is_absolute());
-
-            if is_file_path_payload {
+            let file_paths = payload_file_paths(content, content_type);
+            if let Some(file_paths) = file_paths {
                 if content_type == "image" {
                     // For image type with local path, read pixels for better compatibility with chat apps
                     let image_path = &file_paths[0];
                     let bytes = std::fs::read(image_path).map_err(|_| {
-                        AppError::Validation("图片文件已不存在，无法粘贴。".to_string())
+                        AppError::Validation(IMAGE_FILE_MISSING.to_string())
                     })?;
                     copy_image_bytes_to_clipboard(bytes, Some(image_path))?;
                 } else {
@@ -647,9 +729,7 @@ pub async fn prepare_clipboard_payload(
                         .filter(|path| std::path::Path::new(path).exists())
                         .collect();
                     if file_paths.is_empty() {
-                        return Err(AppError::Validation(
-                            "这些文件都已不存在，无法粘贴。".to_string(),
-                        ));
+                        return Err(AppError::Validation(FILES_MISSING.to_string()));
                     }
                     #[cfg(target_os = "macos")]
                     {
@@ -832,12 +912,56 @@ async fn copy_text_with_retry(content: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// This is only a recovery path. The normal path is already frontmost and
-/// proceeds immediately after the initial 8 ms responder handoff.
-async fn ensure_paste_target_frontmost() {
-    if !macos_previous_app_is_frontmost() && handoff_macos_focus_for_paste() {
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+/// How long a refused hand-off may take to bring the target forward.
+const PASTE_TARGET_WAIT_MS: u64 = 300;
+const PASTE_TARGET_POLL_MS: u64 = 20;
+
+/// Whether Cmd+V would reach the paste target. With no target known, any
+/// other app in front will do; the app itself never.
+fn paste_target_ready(target_pid: u32, frontmost_pid: u32, own_pid: u32) -> bool {
+    if frontmost_pid == 0 || frontmost_pid == own_pid {
+        return false;
     }
+    target_pid == 0 || frontmost_pid == target_pid
+}
+
+fn paste_target_is_frontmost() -> bool {
+    paste_target_ready(
+        crate::global_state::LAST_ACTIVE_APP_PID.load(Ordering::Relaxed),
+        crate::infrastructure::macos_api::window::get_active_app_snapshot().pid,
+        std::process::id(),
+    )
+}
+
+/// The normal path is already frontmost and proceeds at once. Otherwise the
+/// hand-off is retried; a target that never comes forward stops the paste,
+/// so the keystroke can't land in another app.
+async fn ensure_paste_target_frontmost() -> AppResult<()> {
+    if paste_target_is_frontmost() {
+        return Ok(());
+    }
+    handoff_macos_focus_for_paste();
+    let mut waited = 0;
+    while waited < PASTE_TARGET_WAIT_MS {
+        tokio::time::sleep(std::time::Duration::from_millis(PASTE_TARGET_POLL_MS)).await;
+        waited += PASTE_TARGET_POLL_MS;
+        if paste_target_is_frontmost() {
+            return Ok(());
+        }
+    }
+    Err(AppError::Validation("paste_target_unavailable".to_string()))
+}
+
+/// The keystroke goes only to a confirmed target, and `after` (delete after
+/// paste, use count, move to top) runs only once the keystroke went out.
+async fn paste_and_then<T>(
+    confirm_target: impl std::future::Future<Output = AppResult<()>>,
+    send_keystroke: impl FnOnce() -> AppResult<()>,
+    after: impl std::future::Future<Output = AppResult<T>>,
+) -> AppResult<T> {
+    confirm_target.await?;
+    send_keystroke()?;
+    after.await
 }
 
 async fn perform_paste_action(
@@ -847,17 +971,12 @@ async fn perform_paste_action(
     delete_after_use: bool,
     move_to_top: Option<bool>,
 ) -> AppResult<()> {
-    ensure_paste_target_frontmost().await;
-
-    send_paste_keystroke();
-
-    // Hide after paste if not pinned
-    hide_window_after_paste(app_handle).await;
-
-    // Handle post-paste actions
-    handle_post_paste_actions(app_handle, state, id, delete_after_use, move_to_top)?;
-
-    Ok(())
+    paste_and_then(ensure_paste_target_frontmost(), send_paste_keystroke, async {
+        // Hide after paste if not pinned
+        hide_window_after_paste(app_handle).await;
+        handle_post_paste_actions(app_handle, state, id, delete_after_use, move_to_top)
+    })
+    .await
 }
 
 async fn hide_window_after_paste(app_handle: &tauri::AppHandle) {
@@ -872,17 +991,21 @@ async fn hide_window_after_paste(app_handle: &tauri::AppHandle) {
     }
 }
 
-pub fn send_paste_keystroke() {
+/// Errors when the keystroke could not be sent: callers then skip the
+/// after-paste steps (a deletion would lose an entry that was never pasted).
+pub fn send_paste_keystroke() -> AppResult<()> {
     // Focus was already handed off and allowed to settle before the clipboard
     // payload was prepared. Do not schedule another NSPanel resign here: it
     // can race the Command+V event.
     if !crate::infrastructure::macos_api::permissions::has_accessibility_permission() {
         println!("[WARN] Accessibility permission missing; open Settings → Privacy → Accessibility");
-        return;
+        return Err(AppError::Validation("accessibility_permission_required".to_string()));
     }
     if !crate::infrastructure::macos_api::permissions::send_command_v() {
         println!("[WARN] Native Command+V dispatch failed");
+        return Err(AppError::Internal("paste_keystroke_failed".to_string()));
     }
+    Ok(())
 }
 
 fn handle_post_paste_actions(
@@ -967,6 +1090,88 @@ fn handle_post_paste_actions(
 }
 
 
+
+#[cfg(test)]
+mod paste_flow_tests {
+    use super::{
+        check_payload_files, paste_and_then, paste_target_ready, should_restore_clipboard,
+    };
+    use crate::error::{AppError, AppResult};
+    use std::cell::Cell;
+
+    fn run(
+        target: AppResult<()>,
+        keystroke: AppResult<()>,
+    ) -> (AppResult<()>, bool, bool) {
+        let sent = Cell::new(false);
+        let after_ran = Cell::new(false);
+        let result = tauri::async_runtime::block_on(paste_and_then(
+            async { target },
+            || {
+                sent.set(true);
+                keystroke
+            },
+            async {
+                after_ran.set(true);
+                Ok(())
+            },
+        ));
+        (result, sent.get(), after_ran.get())
+    }
+
+    #[test]
+    fn nothing_is_deleted_when_the_target_or_keystroke_fails() {
+        let (result, sent, after) =
+            run(Err(AppError::Validation("paste_target_unavailable".into())), Ok(()));
+        assert!(result.is_err());
+        assert!(!sent, "no keystroke without a confirmed target");
+        assert!(!after, "no delete after paste");
+
+        let (result, sent, after) =
+            run(Ok(()), Err(AppError::Internal("paste_keystroke_failed".into())));
+        assert!(result.is_err() && sent && !after);
+
+        let (result, sent, after) = run(Ok(()), Ok(()));
+        assert!(result.is_ok() && sent && after);
+    }
+
+    #[test]
+    fn the_keystroke_waits_for_the_target_app() {
+        const OWN: u32 = 10;
+        assert!(paste_target_ready(42, 42, OWN));
+        assert!(!paste_target_ready(42, 43, OWN), "another app is in front");
+        assert!(!paste_target_ready(42, OWN, OWN));
+        assert!(!paste_target_ready(42, 0, OWN));
+        // No target recorded: any other app, never the app itself.
+        assert!(paste_target_ready(0, 43, OWN));
+        assert!(!paste_target_ready(0, OWN, OWN));
+    }
+
+    #[test]
+    fn the_clipboard_is_restored_only_over_the_batch_write() {
+        assert!(should_restore_clipboard(true, true));
+        assert!(!should_restore_clipboard(true, false), "the user copied something newer");
+        assert!(!should_restore_clipboard(false, true), "nothing was written");
+    }
+
+    #[test]
+    fn batch_steps_are_checked_for_missing_files_before_any_write() {
+        let root = std::env::temp_dir().join(format!("cp-batch-check-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let image = root.join("img.png");
+        std::fs::write(&image, b"png").unwrap();
+        let image = image.to_string_lossy().into_owned();
+        let gone = root.join("gone.png").to_string_lossy().into_owned();
+
+        assert!(check_payload_files(&image, "image").is_ok());
+        assert!(check_payload_files(&gone, "image").is_err());
+        assert!(check_payload_files(&format!("{gone}\n{image}"), "file").is_ok());
+        assert!(check_payload_files(&gone, "file").is_err());
+        assert!(check_payload_files("data:image/png;base64,AAAA", "image").is_ok());
+        assert!(check_payload_files(&gone, "text").is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
 
 #[cfg(test)]
 mod tests {

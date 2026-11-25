@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ClipboardEntry, Translate } from "../../shared/types";
 import { startWindowDrag } from "../../shared/lib/windowDrag";
@@ -25,20 +25,31 @@ const EditPanel = ({
 }: EditPanelProps) => {
   const [text, setText] = useState<string | null>(null);
 
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  const toastRef = useRef(pushToast);
+  toastRef.current = pushToast;
+  const tRef = useRef(t);
+  tRef.current = t;
+
   useEffect(() => {
     let alive = true;
-    // The list holds a shortened copy of long entries.
+    // The list holds a shortened copy of long entries. Without the full text
+    // there is nothing to edit: saving the copy would cut the entry short.
     invoke<string>("get_clipboard_content", { id: entry.id })
       .then((full) => {
         if (alive) setText(full);
       })
-      .catch(() => {
-        if (alive) setText(entry.content);
+      .catch((error) => {
+        if (!alive) return;
+        console.error("Full content failed to load", error);
+        toastRef.current(tRef.current("content_load_failed"), 3000);
+        closeRef.current();
       });
     return () => {
       alive = false;
     };
-  }, [entry.content, entry.id]);
+  }, [entry.id]);
 
   const fail = (error: unknown) => pushToast(t("save_failed") + String(error), 3000);
   const save = () => invoke("update_item_content", { id: entry.id, newContent: text ?? "" });

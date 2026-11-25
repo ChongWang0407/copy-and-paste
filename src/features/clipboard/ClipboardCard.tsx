@@ -7,6 +7,7 @@ import { hasMatch, splitMatches, type TextPart } from "./searchHighlight";
 import { formatAge } from "../../shared/lib/formatAge";
 import { getSourceAppIcon, peekSourceAppIcon } from "../../shared/lib/sourceAppIcon";
 import { getFileIcon, peekFileIcon } from "../../shared/lib/fileIcon";
+import { setBounded } from "../../shared/lib/boundedCache";
 import { useImageThumbnail, useVideoThumbnail } from "../../shared/hooks/useImageThumbnail";
 import { cardImageBox, type ImageSize } from "./cardImage";
 import { useNow } from "./useNow";
@@ -93,6 +94,7 @@ const SourceIcon = ({ path }: { path?: string }) => {
 
 /** Per entry, so a card scrolled back into view has its height right away. */
 const imageSizes = new Map<number, ImageSize>();
+const IMAGE_SIZE_LIMIT = 500;
 
 const ImagePreview = ({ item, t }: { item: ClipboardEntry; t: Translate }) => {
   const missing = item.is_external && item.file_preview_exists === false;
@@ -128,7 +130,7 @@ const ImagePreview = ({ item, t }: { item: ClipboardEntry; t: Translate }) => {
             const { naturalWidth: width, naturalHeight: height } = event.currentTarget;
             if (!width || !height || (size?.width === width && size.height === height)) return;
             const loaded = { width, height };
-            imageSizes.set(item.id, loaded);
+            setBounded(imageSizes, item.id, loaded, IMAGE_SIZE_LIMIT);
             setSize(loaded);
           }}
           onError={() => setFailed(true)}
@@ -340,6 +342,12 @@ const ClipboardCard = ({
               <button type="button" className="card-action is-danger" title={t("delete")} aria-label={t("delete")} onClick={action(onDelete)}>
                 <Trash2 size={12} />
               </button>
+            </span>
+          )}
+          {/* Batch mode hides the actions: this shows which ticked entries are pinned. */}
+          {batchMode && item.is_pinned && (
+            <span className="card-pin-badge" title={t("pin_top")} aria-label={t("pin_top")}>
+              <ArrowUpToLine size={11} />
             </span>
           )}
           <time className="card-time">{formatAge(item.created_at || item.timestamp, now)}</time>

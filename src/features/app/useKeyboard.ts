@@ -1,10 +1,12 @@
 import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { ClipboardEntry } from "../../shared/types";
+import type { ClipboardEntry, SidePanelKind } from "../../shared/types";
 import { cycleTypeFilter, type TypeFilter } from "../../shared/lib/clipboardTypes";
+import { resolveKey } from "./keyboardRules";
 
 interface KeyboardOptions {
   items: ClipboardEntry[];
+  /** The list's own keys apply (not while settings or an editing panel is open). */
   enabled: boolean;
   arrowKeys: boolean;
   selectedIndex: number | null;
@@ -16,6 +18,15 @@ interface KeyboardOptions {
   focusSearch: () => void;
   /** Esc: closes what's open. False when nothing was. */
   dismiss: () => boolean;
+  panel: SidePanelKind | null;
+  /** Settings or setting the fixed position. */
+  blocked: boolean;
+  batchCount: number;
+  canSelectAll: boolean;
+  /** Cmd+A on the list: batch mode with everything shown ticked. */
+  startBatchSelectAll: () => void;
+  toggleSelectAll: () => void;
+  requestBatchDelete: () => void;
 }
 
 export const isField = (target: EventTarget | null) =>
@@ -31,63 +42,59 @@ export const useKeyboard = (options: KeyboardOptions) => {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const current = ref.current;
-      if (event.defaultPrevented || event.isComposing || event.key === "Process") return;
-      if (hasOpenDialog()) return;
-
-      if (event.key === "Escape") {
-        event.preventDefault();
-        if (isField(event.target)) (event.target as HTMLElement).blur();
-        // escape_window_cmd also unpins: Esc is the only way out of a pinned window.
-        if (!current.dismiss()) invoke("escape_window_cmd").catch(console.error);
-        return;
-      }
-      if (!current.enabled) return;
-
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
-        event.preventDefault();
-        current.focusSearch();
-        return;
-      }
-
+      if (event.defaultPrevented) return;
       const inSearch = event.target instanceof HTMLElement && event.target.classList.contains("searchbox-input");
-      const inOtherField = isField(event.target) && !inSearch;
-      if (inOtherField) return;
+      const action = resolveKey(event, {
+        dialogOpen: hasOpenDialog(),
+        inSearch,
+        inField: isField(event.target),
+        panel: current.panel,
+        blocked: current.blocked,
+        listKeys: current.enabled,
+        arrowKeys: current.arrowKeys,
+        itemCount: current.items.length,
+        selectedIndex: current.selectedIndex,
+        batchCount: current.batchCount,
+        canSelectAll: current.canSelectAll,
+      });
+      if (action.type === "ignore") return;
+      event.preventDefault();
+      const selected = current.selectedIndex === null ? undefined : current.items[current.selectedIndex];
 
-      if (event.key === "Tab" && !event.metaKey && !event.ctrlKey && !event.altKey) {
-        event.preventDefault();
-        current.setTypeFilter(cycleTypeFilter(current.typeFilter, event.shiftKey ? -1 : 1));
-        current.setSelectedIndex(null);
-        return;
-      }
-
-      if (current.arrowKeys && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
-        event.preventDefault();
-        const last = current.items.length - 1;
-        if (last < 0) return;
-        const position = current.selectedIndex;
-        const next =
-          event.key === "ArrowDown"
-            ? position === null ? 0 : Math.min(position + 1, last)
-            : position === null ? 0 : Math.max(position - 1, 0);
-        current.setSelectedIndex(next);
-        return;
-      }
-
-      const selected = current.selectedIndex === null ? null : current.items[current.selectedIndex];
-      if (!selected) return;
-
-      if (event.key === "Enter") {
-        event.preventDefault();
-        event.stopPropagation();
-        current.paste(selected);
-        return;
-      }
-
-      const forwardDelete = event.key === "Delete";
-      const commandDelete = event.metaKey && event.key === "Backspace";
-      if ((forwardDelete || commandDelete) && !inSearch) {
-        event.preventDefault();
-        current.remove(selected);
+      switch (action.type) {
+        case "escape":
+          if (isField(event.target)) (event.target as HTMLElement).blur();
+          // escape_window_cmd also unpins: Esc is the only way out of a pinned window.
+          if (!current.dismiss()) invoke("escape_window_cmd").catch(console.error);
+          return;
+        case "focusSearch":
+          current.focusSearch();
+          return;
+        case "cycleType":
+          current.setTypeFilter(cycleTypeFilter(current.typeFilter, action.step));
+          current.setSelectedIndex(null);
+          return;
+        case "select":
+          current.setSelectedIndex(action.index);
+          return;
+        case "paste":
+          event.stopPropagation();
+          if (selected) current.paste(selected);
+          return;
+        case "remove":
+          if (selected) current.remove(selected);
+          return;
+        case "startBatchSelectAll":
+          current.startBatchSelectAll();
+          return;
+        case "toggleSelectAll":
+          current.toggleSelectAll();
+          return;
+        case "batchDelete":
+          current.requestBatchDelete();
+          return;
+        case "consume":
+          return;
       }
     };
 

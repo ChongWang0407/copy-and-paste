@@ -19,6 +19,20 @@ import EditPanel from "./features/edit/EditPanel";
 import TranslatePanel from "./features/translate/TranslatePanel";
 import type { TranslationConfig } from "./features/translate/config";
 import BatchPanel from "./features/batch/BatchPanel";
+import {
+  allVisibleSelected,
+  applyEntryStates,
+  batchDeleteMessage,
+  deletionRequest,
+  entryKey,
+  indexOfEntry,
+  refreshSelection,
+  selectAllVisible,
+  selectionCounts,
+  toggleSelectAllVisible,
+  type EntryKey,
+  type EntryState,
+} from "./features/batch/batchSelection";
 import PreviewPanel from "./features/preview/PreviewPanel";
 import { useSpacePreview } from "./features/preview/useSpacePreview";
 import SettingsPage from "./features/settings/components/SettingsPage";
@@ -51,7 +65,8 @@ const App = () => {
   const [draft, setDraft] = useState("");
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<TypeFilter | null>(null);
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  // The entry picked with the arrow keys, not its row: rows shift as copies come and go.
+  const [selectedKey, setSelectedKey] = useState<EntryKey | null>(null);
   const [isWindowPinned, setIsWindowPinned] = useState(false);
   const pinMode = normalizePinMode(values[PIN_MODE_KEY]);
   const pinModeRef = useRef(pinMode);
@@ -65,6 +80,7 @@ const App = () => {
   const [settingFixedPosition, setSettingFixedPosition] = useState(false);
   const [editing, setEditing] = useState<ClipboardEntry | null>(null);
   const [batchItems, setBatchItems] = useState<ClipboardEntry[]>([]);
+  const [batchDeleting, setBatchDeleting] = useState(false);
   const [previewEntry, setPreviewEntry] = useState<ClipboardEntry | null>(null);
   const [hasNativeGlass, setHasNativeGlass] = useState(true);
   const [translationConfig, setTranslationConfig] = useState<TranslationConfig | null>(null);
@@ -78,8 +94,26 @@ const App = () => {
   const searchRef = useRef<SearchBoxHandle | null>(null);
   const listRef = useRef<ClipboardListHandle | null>(null);
 
-  const { items, setItems, hasMore, loading, loaded, loadMore, refetch } = useHistory(search, typeFilter, ready);
+  const { items, hasMore, loading, loaded, settled, loadMore, refetch, removeItems } = useHistory(
+    search,
+    typeFilter,
+    ready
+  );
   const { panel, open: openPanel, close: closePanel } = useSidePanel();
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const batchItemsRef = useRef(batchItems);
+  batchItemsRef.current = batchItems;
+
+  const selectedIndex = useMemo(() => indexOfEntry(items, selectedKey), [items, selectedKey]);
+  const setSelectedIndex = useCallback((index: number | null) => {
+    const entry = index === null ? undefined : itemsRef.current[index];
+    setSelectedKey(entry ? entryKey(entry) : null);
+  }, []);
+  // The picked entry is gone (deleted, or not in this list): nothing stays picked.
+  useEffect(() => {
+    if (selectedKey && selectedIndex === null) setSelectedKey(null);
+  }, [selectedIndex, selectedKey]);
 
   const deleteAfterPaste = flag("app.delete_after_paste");
   const moveToTopAfterPaste = flag("app.move_to_top_after_paste", true);
@@ -87,7 +121,7 @@ const App = () => {
   const afterPaste = useCallback(() => {
     setDraft("");
     setSearch("");
-    setSelectedIndex(null);
+    setSelectedKey(null);
   }, []);
 
   const { paste, pasteImageText, failed } = usePasteActions({
@@ -120,14 +154,33 @@ const App = () => {
     [pushToast, t]
   );
 
+  // Batch mode has no keyboard pick: a highlighted card would look ticked.
   const startBatch = useCallback(
     (item: ClipboardEntry) => {
       setEditing(null);
+      setSelectedKey(null);
       setBatchItems([item]);
       void openPanel("batch");
     },
     [openPanel]
   );
+
+  // Cmd+A on the list.
+  const startBatchSelectAll = useCallback(() => {
+    setEditing(null);
+    setSelectedKey(null);
+    setBatchItems(selectAllVisible([], itemsRef.current));
+    void openPanel("batch");
+  }, [openPanel]);
+
+  const toggleSelectAll = useCallback(() => {
+    setBatchItems((prev) => toggleSelectAllVisible(prev, itemsRef.current));
+  }, []);
+
+  // The ticked entries follow the list (pin state), so the confirmation counts right.
+  useEffect(() => {
+    setBatchItems((prev) => refreshSelection(prev, items));
+  }, [items]);
 
   // 分享: the system share menu, anchored to the card (right-click menu's last item).
   const shareEntry = useCallback(
@@ -223,13 +276,13 @@ const App = () => {
 
   const deleteEntry = useCallback(
     (item: ClipboardEntry) => {
-      setItems((prev) => prev.filter((entry) => entry.id !== item.id));
+      removeItems([item.id]);
       invoke("delete_clipboard_entry", { id: item.id }).catch((error) => {
         pushToast(t("delete_failed") + String(error), 3000);
         void refetch(true);
       });
     },
-    [pushToast, refetch, setItems, t]
+    [pushToast, refetch, removeItems, t]
   );
 
   const closeSidePanel = useCallback(() => {
@@ -238,6 +291,54 @@ const App = () => {
     setPreviewEntry(null);
     void closePanel();
   }, [closePanel]);
+
+  const batchDeletingRef = useRef(false);
+  const deleteBatch = useCallback(
+    async (frozen: EntryState[]) => {
+      batchDeletingRef.current = true;
+      setBatchDeleting(true);
+      try {
+        const count = await invoke<number>("delete_clipboard_entries", { items: frozen });
+        removeItems(frozen.map((item) => item.id));
+        closeSidePanel();
+        pushToast(t("batch_deleted").replace("{count}", String(count)));
+      } catch (error) {
+        if (String(error).includes("selection_changed")) {
+          // Something ticked was deleted, replaced or (un)pinned meanwhile:
+          // bring the ticks up to date and let the user confirm again.
+          const states = await invoke<EntryState[]>("get_clipboard_entry_states", {
+            ids: frozen.map((item) => item.id),
+          }).catch(() => null);
+          if (states) setBatchItems((prev) => applyEntryStates(prev, states));
+          pushToast(t("batch_selection_changed"), 3000);
+        } else {
+          pushToast(t("delete_failed") + String(error), 3000);
+        }
+        void refetch(true);
+      } finally {
+        batchDeletingRef.current = false;
+        setBatchDeleting(false);
+      }
+    },
+    [closeSidePanel, pushToast, refetch, removeItems, t]
+  );
+
+  const requestBatchDelete = useCallback(() => {
+    const selection = batchItemsRef.current;
+    if (selection.length === 0 || batchDeletingRef.current) return;
+    // Frozen now: what the dialog counts is exactly what gets deleted.
+    const frozen = deletionRequest(selection);
+    openConfirm({
+      title: t("batch_delete_title"),
+      message: batchDeleteMessage(t, selectionCounts(selection, itemsRef.current)),
+      danger: true,
+      confirmLabel: t("delete"),
+      onConfirm: () => {
+        closeConfirm();
+        void deleteBatch(frozen);
+      },
+    });
+  }, [closeConfirm, deleteBatch, openConfirm, t]);
 
   // A preview borrows the panel area: 常用 comes back when it ends.
   const favoritesUnderPreview = useRef(false);
@@ -278,8 +379,8 @@ const App = () => {
       leaveSettings();
       return true;
     }
-    if (selectedIndex !== null) {
-      setSelectedIndex(null);
+    if (selectedKey !== null) {
+      setSelectedKey(null);
       return true;
     }
     if (draft || search) {
@@ -288,7 +389,7 @@ const App = () => {
       return true;
     }
     return false;
-  }, [closeSidePanel, draft, leaveSettings, panel.kind, search, selectedIndex, settingFixedPosition, showSettings]);
+  }, [closeSidePanel, draft, leaveSettings, panel.kind, search, selectedKey, settingFixedPosition, showSettings]);
 
   // 编辑 and 翻译 take typing: the list's keys stay off while they are open.
   const typingInPanel = panel.kind === "edit" || panel.kind === "translate";
@@ -305,6 +406,13 @@ const App = () => {
     remove: deleteEntry,
     focusSearch: () => searchRef.current?.focus(),
     dismiss,
+    panel: panel.kind,
+    blocked: showSettings || settingFixedPosition,
+    batchCount: batchItems.length,
+    canSelectAll: settled,
+    startBatchSelectAll,
+    toggleSelectAll,
+    requestBatchDelete,
   });
 
   useSpacePreview({
@@ -337,9 +445,9 @@ const App = () => {
     };
   }, [ready, sidePanelResizingWindow]);
 
-  // The selection follows the list, not a stale index.
+  // A new search or tab starts with nothing picked.
   useEffect(() => {
-    setSelectedIndex(null);
+    setSelectedKey(null);
   }, [search, typeFilter]);
 
   useEffect(() => {
@@ -348,7 +456,7 @@ const App = () => {
       // Each opening starts unfiltered: a filter is for digging one item out.
       listen("clipboard-shown", () => {
         setTypeFilter(null);
-        setSelectedIndex(null);
+        setSelectedKey(null);
         listRef.current?.scrollToTop();
       }),
       listen<boolean>("window-pinned-changed", ({ payload }) => updateWindowPinned(payload)),
@@ -424,6 +532,7 @@ const App = () => {
       title: t("clear_confirm_title"),
       message: t("clear_confirm_message"),
       danger: true,
+      confirmLabel: t("clear_confirm_ok"),
       onConfirm: () => {
         closeConfirm();
         invoke("clear_clipboard_history").catch((error) => pushToast(t("clear_failed") + String(error), 3000));
@@ -436,6 +545,7 @@ const App = () => {
       title: t("reset_defaults"),
       message: t("reset_confirm"),
       danger: true,
+      confirmLabel: t("reset_ok"),
       onConfirm: () => {
         closeConfirm();
         invoke("reset_settings")
@@ -453,25 +563,50 @@ const App = () => {
   const batchIds = useMemo(() => new Set(batchItems.map((item) => item.id)), [batchItems]);
   const showSourceIcon = flag("app.show_source_app_icon", true);
 
-  const renderItem = (item: ClipboardEntry) => (
-    <ClipboardCard
-      item={item}
-      t={t}
-      selected={selectedIndex !== null && items[selectedIndex]?.id === item.id}
-      showSourceIcon={showSourceIcon}
-      batchMode={batchMode}
-      batchChecked={batchIds.has(item.id)}
-      onPaste={paste as (entry: ClipboardEntry) => void}
-      onToggleBatch={toggleBatch}
-      onContextMenu={showCardMenu}
-      onEdit={editEntry}
-      onTogglePin={togglePin}
-      onDelete={deleteEntry}
-      onPasteAsText={pasteImageTextEntry}
-      onTranslate={canTranslate ? translateEntry : undefined}
-      searchTerm={search}
-    />
+  // No highlighted card in batch mode: it would look ticked.
+  const selectedId = !batchMode && selectedIndex !== null ? items[selectedIndex]?.id : undefined;
+  const allSelected = useMemo(() => allVisibleSelected(batchItems, items), [batchItems, items]);
+
+  // Stable between keystrokes in the search box, so typing doesn't re-render the list.
+  const renderItem = useCallback(
+    (item: ClipboardEntry) => (
+      <ClipboardCard
+        item={item}
+        t={t}
+        selected={item.id === selectedId}
+        showSourceIcon={showSourceIcon}
+        batchMode={batchMode}
+        batchChecked={batchIds.has(item.id)}
+        onPaste={paste as (entry: ClipboardEntry) => void}
+        onToggleBatch={toggleBatch}
+        onContextMenu={showCardMenu}
+        onEdit={editEntry}
+        onTogglePin={togglePin}
+        onDelete={deleteEntry}
+        onPasteAsText={pasteImageTextEntry}
+        onTranslate={canTranslate ? translateEntry : undefined}
+        searchTerm={search}
+      />
+    ),
+    [
+      batchIds,
+      batchMode,
+      canTranslate,
+      deleteEntry,
+      editEntry,
+      paste,
+      pasteImageTextEntry,
+      search,
+      selectedId,
+      showCardMenu,
+      showSourceIcon,
+      t,
+      toggleBatch,
+      togglePin,
+      translateEntry,
+    ]
   );
+  const loadMoreItems = useCallback(() => void loadMore(), [loadMore]);
 
   if (!ready) return <div className="app-shell" />;
 
@@ -534,7 +669,7 @@ const App = () => {
                 hasMore={hasMore}
                 loading={loading}
                 selectedIndex={selectedIndex}
-                onLoadMore={() => void loadMore()}
+                onLoadMore={loadMoreItems}
                 renderItem={renderItem}
               />
             </div>
@@ -579,6 +714,12 @@ const App = () => {
             <BatchPanel
               t={t}
               items={batchItems}
+              allVisibleSelected={allSelected}
+              canSelectAll={settled && items.length > 0}
+              hasMore={hasMore}
+              deleting={batchDeleting}
+              onToggleSelectAll={toggleSelectAll}
+              onDeleteSelected={requestBatchDelete}
               onReorder={setBatchItems}
               onRemove={toggleBatch}
               deleteAfterPaste={deleteAfterPaste}
@@ -603,7 +744,7 @@ const App = () => {
       <ToastContainer toasts={toasts} />
       <ConfirmDialog
         state={confirmDialog}
-        confirmLabel={confirmDialog.danger ? t("clear_confirm_ok") : t("confirm")}
+        confirmLabel={confirmDialog.confirmLabel ?? t("confirm")}
         cancelLabel={t("cancel")}
         onClose={closeConfirm}
       />
