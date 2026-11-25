@@ -1,6 +1,6 @@
-use crate::database::is_sensitive_key;
+use crate::database::{is_sensitive_key, is_translation_secret};
 use crate::infrastructure::encryption;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -26,21 +26,28 @@ impl SqliteSettingsRepository {
     }
 
     pub fn get_raw(conn: &Connection, key: &str) -> Result<Option<String>> {
-        let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?")?;
-        let mut rows = stmt.query(params![key])?;
+        Self::get_stored(conn, key)?
+            .map(|value| Self::decode_value(key, value))
+            .transpose()
+    }
 
-        if let Some(row) = rows.next()? {
-            let value: String = row.get(0)?;
-            if is_sensitive_key(key) && encryption::is_encrypted_value(&value) {
-                return Ok(Some(Self::decrypt_sensitive_value(key, &value)?));
-            }
-            Ok(Some(value))
+    pub(crate) fn get_stored(conn: &Connection, key: &str) -> Result<Option<String>> {
+        conn.query_row("SELECT value FROM settings WHERE key = ?", [key], |row| row.get(0))
+            .optional()
+    }
+
+    pub(crate) fn decode_value(key: &str, value: String) -> Result<String> {
+        if is_sensitive_key(key) && encryption::is_encrypted_value(&value) {
+            Self::decrypt_sensitive_value(key, &value)
         } else {
-            Ok(None)
+            Ok(value)
         }
     }
 
-    fn maybe_encrypt(&self, key: &str, value: &str) -> Result<String> {
+    pub(crate) fn encode_value(key: &str, value: &str) -> Result<String> {
+        if is_translation_secret(key) {
+            return encryption::encrypt_translation_key(value).map_err(Self::encryption_error);
+        }
         if is_sensitive_key(key) {
             return encryption::encrypt_for_storage(value).map_err(Self::encryption_error);
         }
@@ -77,7 +84,7 @@ impl SettingsRepository for SqliteSettingsRepository {
             // whose secret can't be decrypted unable to fix it.
             Self::get_raw(&tx, key)?;
         }
-        let final_value = self.maybe_encrypt(key, value)?;
+        let final_value = Self::encode_value(key, value)?;
 
         tx.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
@@ -87,18 +94,7 @@ impl SettingsRepository for SqliteSettingsRepository {
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?")?;
-        let mut rows = stmt.query(params![key])?;
-
-        if let Some(row) = rows.next()? {
-            let value: String = row.get(0)?;
-            let decrypted = self.maybe_decrypt(key, &value)?;
-
-            Ok(Some(decrypted))
-        } else {
-            Ok(None)
-        }
+        Self::get_raw(&self.conn.lock().unwrap(), key)
     }
 
     fn get_all(&self) -> Result<HashMap<String, String>> {
@@ -111,6 +107,9 @@ impl SettingsRepository for SqliteSettingsRepository {
         let mut settings = HashMap::new();
         for row in rows {
             let (key, value) = row?;
+            if is_translation_secret(&key) {
+                continue;
+            }
             match self.maybe_decrypt(&key, &value) {
                 Ok(decrypted) => {
                     settings.insert(key, decrypted);

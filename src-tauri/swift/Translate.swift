@@ -34,12 +34,30 @@ private final class Reply: @unchecked Sendable {
         self.callback = callback
     }
 
+    deinit { send(.failed, "cancelled") }
+
+    var pending: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !sent
+    }
+
     func send(_ code: Code, _ text: String) {
         lock.lock()
         defer { lock.unlock() }
         guard !sent else { return }
         sent = true
         text.withCString { callback(context, code.rawValue, $0) }
+    }
+
+    func armTimeout() {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 60) { [weak self] in
+            guard let self else { return }
+            self.send(.failed, "timeout")
+            if #available(macOS 26.0, *) {
+                Task { @MainActor in DownloadHost.remove(for: self) }
+            }
+        }
     }
 }
 
@@ -82,33 +100,21 @@ private func describe(_ error: Error) -> String {
 // MARK: - Download path (SwiftUI)
 
 @available(macOS 26.0, *)
-@MainActor
-private final class DownloadModel: ObservableObject {
-    @Published var configuration: TranslationSession.Configuration?
-    var job: Job?
-}
-
-@available(macOS 26.0, *)
 private struct DownloadHostView: View {
-    @ObservedObject var model: DownloadModel
+    let job: Job
+    let configuration: TranslationSession.Configuration
 
     var body: some View {
         Color.clear
             .frame(width: 1, height: 1)
-            .translationTask(model.configuration) { session in
-                // The session is only valid inside this closure, so the job
-                // runs to the end here.
-                let job = await MainActor.run { () -> Job? in
-                    let job = model.job
-                    model.job = nil
-                    return job
-                }
-                guard let job else { return }
+            .translationTask(configuration) { session in
+                guard job.reply.pending else { return }
                 do {
                     job.reply.send(.ok, try await translateLines(job.text, with: session))
                 } catch {
                     job.reply.send(.failed, describe(error))
                 }
+                await DownloadHost.remove(for: job.reply)
             }
     }
 }
@@ -116,31 +122,30 @@ private struct DownloadHostView: View {
 @available(macOS 26.0, *)
 @MainActor
 private enum DownloadHost {
-    static let model = DownloadModel()
     static weak var hostView: NSView?
+    static weak var activeReply: Reply?
 
     static func run(_ job: Job, in window: NSWindow) {
-        attach(to: window)
-        // A newer request replaces one still waiting on the prompt.
-        model.job?.reply.send(.failed, "cancelled")
-        model.job = job
-        if var configuration = model.configuration,
-           configuration.source == job.source, configuration.target == job.target {
-            configuration.invalidate()
-            model.configuration = configuration
-        } else {
-            model.configuration = .init(source: job.source, target: job.target)
+        guard job.reply.pending else { return }
+        guard let content = window.contentView else {
+            job.reply.send(.failed, "no_window")
+            return
         }
+        activeReply?.send(.failed, "cancelled")
+        hostView?.removeFromSuperview()
+        let configuration = TranslationSession.Configuration(source: job.source, target: job.target)
+        let view = NSHostingView(rootView: DownloadHostView(job: job, configuration: configuration))
+        view.frame = NSRect(x: 0, y: 0, width: 1, height: 1)
+        activeReply = job.reply
+        hostView = view
+        content.addSubview(view)
     }
 
-    private static func attach(to window: NSWindow) {
-        if let view = hostView, view.window === window { return }
+    static func remove(for reply: Reply) {
+        guard activeReply === reply else { return }
         hostView?.removeFromSuperview()
-        guard let content = window.contentView else { return }
-        let view = NSHostingView(rootView: DownloadHostView(model: model))
-        view.frame = NSRect(x: 0, y: 0, width: 1, height: 1)
-        content.addSubview(view)
-        hostView = view
+        hostView = nil
+        activeReply = nil
     }
 }
 
@@ -161,15 +166,15 @@ public func cp_translation_supported() -> Int32 {
     return 0
 }
 
-/// Translates `text` from `source` to `target` ("zh-Hans" or "en"). `window`
-/// is the NSWindow the download prompt attaches to. `callback` runs once, on
+/// Translates `text` from `source` to `target` ("zh-Hans" or "en"). `view`
+/// is the main-thread webview. `callback` runs once, on
 /// any thread, with a result code and the translation or an error message.
 @_cdecl("cp_translate")
 public func cp_translate(
     _ text: UnsafePointer<CChar>,
     _ source: UnsafePointer<CChar>,
     _ target: UnsafePointer<CChar>,
-    _ window: UnsafeMutableRawPointer?,
+    _ view: UnsafeMutableRawPointer?,
     _ context: UnsafeMutableRawPointer?,
     _ callback: TranslateCallback
 ) {
@@ -183,28 +188,34 @@ public func cp_translate(
         reply.send(.unsupportedPair, "unsupported_pair")
         return
     }
-    let windowAddress = window.map { UInt(bitPattern: $0) } ?? 0
+    guard let view,
+          let window = Unmanaged<NSView>.fromOpaque(view).takeUnretainedValue().window,
+          window.contentView != nil else {
+        reply.send(.failed, "no_window")
+        return
+    }
     let job = Job(text: input, source: from, target: to, reply: reply)
+    reply.armTimeout()
 
-    Task.detached {
-        switch await LanguageAvailability().status(from: from, to: to) {
+    Task { @MainActor [weak window] in
+        let status = await LanguageAvailability().status(from: from, to: to)
+        guard reply.pending else { return }
+        switch status {
         case .installed:
-            do {
-                let session = TranslationSession(installedSource: from, target: to)
-                reply.send(.ok, try await translateLines(input, with: session))
-            } catch {
-                reply.send(.failed, describe(error))
+            Task.detached {
+                do {
+                    let session = TranslationSession(installedSource: from, target: to)
+                    reply.send(.ok, try await translateLines(input, with: session))
+                } catch {
+                    reply.send(.failed, describe(error))
+                }
             }
         case .supported:
-            await MainActor.run {
-                guard windowAddress != 0,
-                      let pointer = UnsafeMutableRawPointer(bitPattern: windowAddress) else {
-                    reply.send(.failed, "no_window")
-                    return
-                }
-                let window = Unmanaged<NSWindow>.fromOpaque(pointer).takeUnretainedValue()
-                DownloadHost.run(job, in: window)
+            guard let window else {
+                reply.send(.failed, "no_window")
+                return
             }
+            DownloadHost.run(job, in: window)
         default:
             reply.send(.unsupportedPair, "unsupported_pair")
         }
@@ -228,6 +239,7 @@ public func cp_translation_status(
         reply.send(.ok, "2")
         return
     }
+    reply.armTimeout()
     Task.detached {
         switch await LanguageAvailability().status(from: from, to: to) {
         case .installed: reply.send(.ok, "0")

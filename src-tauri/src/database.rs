@@ -20,6 +20,12 @@ pub struct DbState {
     pub tag_repo: SqliteTagRepository,
 }
 
+pub const TRANSLATE_PROVIDER: &str = "app.translate_provider";
+pub const TRANSLATE_DEEPL_KEY: &str = "app.translate_deepl_key";
+pub const TRANSLATE_OPENAI_BASE_URL: &str = "app.translate_openai_base_url";
+pub const TRANSLATE_OPENAI_MODEL: &str = "app.translate_openai_model";
+pub const TRANSLATE_OPENAI_KEY: &str = "app.translate_openai_key";
+
 const SENSITIVE_KEYS: &[&str] = &[
     "mqtt_password",
     "mqtt_username",
@@ -27,6 +33,8 @@ const SENSITIVE_KEYS: &[&str] = &[
     "cloud_sync_api_key",
     "cloud_sync_webdav_password",
     "e2e_key",
+    TRANSLATE_DEEPL_KEY,
+    TRANSLATE_OPENAI_KEY,
 ];
 
 pub const SENSITIVE_TAGS: &[&str] = &["sensitive", "密码", "password"];
@@ -35,6 +43,18 @@ pub fn is_sensitive_key(key: &str) -> bool {
     SENSITIVE_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key))
 }
 
+pub fn is_translation_secret(key: &str) -> bool {
+    [TRANSLATE_DEEPL_KEY, TRANSLATE_OPENAI_KEY]
+        .iter()
+        .any(|setting| setting.eq_ignore_ascii_case(key))
+}
+
+pub fn is_translation_setting(key: &str) -> bool {
+    is_translation_secret(key)
+        || [TRANSLATE_PROVIDER, TRANSLATE_OPENAI_BASE_URL, TRANSLATE_OPENAI_MODEL]
+            .iter()
+            .any(|setting| setting.eq_ignore_ascii_case(key))
+}
 
 pub fn has_sensitive_tag(tags: &[String]) -> bool {
     tags.iter()

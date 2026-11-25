@@ -74,6 +74,9 @@ pub fn save_setting(
     key: String,
     value: String,
 ) -> AppResult<()> {
+    if crate::database::is_translation_setting(&key) {
+        return Err(AppError::Validation("use save_translation_config".into()));
+    }
     match key.as_str() {
         "app.arrow_key_selection" => {
             settings_state

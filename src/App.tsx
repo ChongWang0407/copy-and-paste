@@ -17,6 +17,7 @@ import ClipboardList, { type ClipboardListHandle } from "./features/clipboard/Cl
 import FavoritesPanel from "./features/favorites/FavoritesPanel";
 import EditPanel from "./features/edit/EditPanel";
 import TranslatePanel from "./features/translate/TranslatePanel";
+import type { TranslationConfig } from "./features/translate/config";
 import BatchPanel from "./features/batch/BatchPanel";
 import PreviewPanel from "./features/preview/PreviewPanel";
 import { useSpacePreview } from "./features/preview/useSpacePreview";
@@ -66,7 +67,8 @@ const App = () => {
   const [batchItems, setBatchItems] = useState<ClipboardEntry[]>([]);
   const [previewEntry, setPreviewEntry] = useState<ClipboardEntry | null>(null);
   const [hasNativeGlass, setHasNativeGlass] = useState(true);
-  const [canTranslate, setCanTranslate] = useState(false);
+  const [translationConfig, setTranslationConfig] = useState<TranslationConfig | null>(null);
+  const canTranslate = translationConfig?.available ?? false;
 
   const pushToastRef = useRef(pushToast);
   pushToastRef.current = pushToast;
@@ -368,7 +370,13 @@ const App = () => {
   useEffect(() => {
     if (!isTauriRuntime()) return;
     invoke<boolean>("supports_liquid_glass").then(setHasNativeGlass).catch(() => setHasNativeGlass(true));
-    invoke<boolean>("translation_supported").then(setCanTranslate).catch(() => setCanTranslate(false));
+    let alive = true;
+    invoke<TranslationConfig>("get_translation_config").then((config) => {
+      if (alive) setTranslationConfig(config);
+    }).catch(() => {
+      if (alive) setTranslationConfig(null);
+    });
+    return () => { alive = false; };
   }, []);
 
   const [glassLevelLive, setGlassLevelLive] = useState<number | null>(null);
@@ -494,6 +502,8 @@ const App = () => {
             settings={settings}
             pinMode={pinMode}
             onSelectPinMode={(mode) => selectPinMode(mode, false)}
+            translationConfig={translationConfig}
+            onTranslationSaved={setTranslationConfig}
             pushToast={pushToast}
             onSetFixedPosition={beginFixedPosition}
             onResetSettings={resetSettings}
@@ -549,11 +559,12 @@ const App = () => {
               onClose={closeSidePanel}
             />
           )}
-          {panel.kind === "translate" && editing && (
+          {panel.kind === "translate" && editing && translationConfig && (
             <TranslatePanel
               key={editing.id}
               t={t}
               entry={editing}
+              config={translationConfig}
               deleteAfterPaste={deleteAfterPaste}
               moveToTopAfterPaste={moveToTopAfterPaste}
               pushToast={pushToast}

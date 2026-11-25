@@ -7,10 +7,12 @@ import { Check, ChevronRight, RotateCcw } from "lucide-react";
 import { FaviconGithub } from "./FaviconGithub";
 import appLogo from "../../../assets/logo.png";
 import AppSelectorModal from "./AppSelectorModal";
+import TranslationSettings from "./groups/TranslationSettings";
 import { HotkeyField, Row, Section, Segmented, Toggle } from "./controls";
 import { chosenApp, unchosenFallback } from "../utils/defaultApps";
 import type { InstalledAppOption } from "../types";
 import type { SettingsStore } from "../../app/useSettings";
+import type { TranslationConfig } from "../../translate/config";
 import { displayNameOf } from "../../app/useSettings";
 import type { Locale, WindowPinMode } from "../../../shared/types";
 import { withNativeDialog } from "../../../shared/lib/focus";
@@ -36,6 +38,8 @@ interface SettingsPageProps {
   settings: SettingsStore;
   pinMode: WindowPinMode;
   onSelectPinMode: (mode: WindowPinMode) => void;
+  translationConfig: TranslationConfig | null;
+  onTranslationSaved: (config: TranslationConfig) => void;
   pushToast: (message: string, duration?: number) => void;
   /** The window stays open while the user drags it to its fixed position. */
   onSetFixedPosition: () => void;
@@ -47,6 +51,8 @@ const SettingsPage = ({
   settings,
   pinMode,
   onSelectPinMode,
+  translationConfig,
+  onTranslationSaved,
   pushToast,
   onSetFixedPosition,
   onResetSettings,
@@ -482,6 +488,16 @@ const SettingsPage = ({
             onChange={(enabled) => save("app.move_to_top_after_paste", String(enabled))}
           />
         </Row>
+      </Section>
+
+      <Section title={t("section_translate")} open={!!openSections.translate} onToggle={() => toggleSection("translate")}>
+        {translationConfig ? (
+          <TranslationSettings config={translationConfig} onSaved={onTranslationSaved} pushToast={pushToast} t={t} />
+        ) : (
+          <div className="setting-row is-column">
+            <p className="translate-note is-warning">{t("translate_err_config_unavailable")}</p>
+          </div>
+        )}
       </Section>
 
       <Section title={t("section_data")} open={!!openSections.data} onToggle={() => toggleSection("data")}>
