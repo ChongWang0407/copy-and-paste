@@ -161,14 +161,6 @@ pub(crate) fn is_attachment_pending(path: &std::path::Path) -> bool {
     PENDING_ATTACHMENTS.lock().unwrap().contains_key(path)
 }
 
-pub(crate) fn remove_idle_attachment(path: &std::path::Path) {
-    let pending = PENDING_ATTACHMENTS.lock().unwrap();
-    if !pending.contains_key(path) {
-        crate::app::commands::thumbnail_cmd::remove_cached_thumbnails(path);
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 fn write_attachment_file(
     dir: &std::path::Path,
     bytes: &[u8],
@@ -659,11 +651,10 @@ mod tests {
             Some(hash as i64)
         );
         drop(first);
-        super::remove_idle_attachment(&path);
-        assert!(path.is_file());
+        assert!(super::is_attachment_pending(&path));
         drop(second);
-        super::remove_idle_attachment(&path);
-        assert!(!path.exists());
+        assert!(!super::is_attachment_pending(&path));
+        std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
 }
