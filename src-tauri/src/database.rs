@@ -88,16 +88,80 @@ pub fn image_extension_from_magic(bytes: &[u8]) -> Option<&'static str> {
 /// write cut short by a crash or a full disk) is rewritten instead of being
 /// reused for good.
 pub fn write_attachment(dir: &std::path::Path, bytes: &[u8], ext: &str) -> Option<std::path::PathBuf> {
+    write_attachment_file(dir, bytes, ext, stable_bytes_hash(bytes), None)
+}
+
+static PENDING_ATTACHMENTS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[derive(Default)]
+pub(crate) struct PendingAttachments(Vec<std::path::PathBuf>);
+
+impl PendingAttachments {
+    pub fn protect(&mut self, path: &std::path::Path) {
+        *PENDING_ATTACHMENTS
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+        self.0.push(path.to_path_buf());
+    }
+
+    pub fn write(
+        &mut self,
+        dir: &std::path::Path,
+        bytes: &[u8],
+        ext: &str,
+        hash: u64,
+    ) -> Option<std::path::PathBuf> {
+        write_attachment_file(dir, bytes, ext, hash, Some(self))
+    }
+}
+
+impl Drop for PendingAttachments {
+    fn drop(&mut self) {
+        let mut pending = PENDING_ATTACHMENTS.lock().unwrap();
+        for path in &self.0 {
+            let count = pending.get_mut(path).expect("registered attachment");
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(path);
+            }
+        }
+    }
+}
+
+pub(crate) fn remove_idle_attachment(path: &std::path::Path) {
+    let pending = PENDING_ATTACHMENTS.lock().unwrap();
+    if !pending.contains_key(path) {
+        crate::app::commands::thumbnail_cmd::remove_cached_thumbnails(path);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn write_attachment_file(
+    dir: &std::path::Path,
+    bytes: &[u8],
+    ext: &str,
+    hash: u64,
+    pending: Option<&mut PendingAttachments>,
+) -> Option<std::path::PathBuf> {
     std::fs::create_dir_all(dir).ok()?;
-    let name = format!("img_{:x}.{}", stable_bytes_hash(bytes), ext);
+    let name = format!("img_{hash:x}.{ext}");
     let path = dir.join(&name);
+    if let Some(pending) = pending {
+        pending.protect(&path);
+    }
     let intact = std::fs::metadata(&path)
         .map(|meta| meta.len() == bytes.len() as u64)
         .unwrap_or(false);
     if !intact {
-        let temp = dir.join(format!(".{}.{}.tmp", name, std::process::id()));
-        std::fs::write(&temp, bytes).ok()?;
-        if std::fs::rename(&temp, &path).is_err() {
+        let temp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+        if std::fs::write(&temp, bytes)
+            .and_then(|()| std::fs::rename(&temp, &path))
+            .is_err()
+        {
             let _ = std::fs::remove_file(&temp);
             return None;
         }
@@ -112,8 +176,7 @@ pub fn calc_image_hash_from_bytes(bytes: &[u8]) -> Option<i64> {
 pub fn calc_image_hash(base64_data: &str) -> Option<i64> {
     let trimmed = base64_data.trim();
     if !trimmed.starts_with("data:") && (trimmed.starts_with('/') || trimmed.contains(":\\")) {
-        let bytes = std::fs::read(trimmed).ok()?;
-        return calc_image_hash_from_bytes(&bytes);
+        return hash_image_file(std::path::Path::new(trimmed));
     }
     let parts: Vec<&str> = trimmed.splitn(2, ',').collect();
     let payload = if parts.len() == 2 { parts[1] } else { trimmed };
@@ -128,6 +191,30 @@ pub fn calc_image_hash(base64_data: &str) -> Option<i64> {
         .ok()?;
 
     calc_image_hash_from_bytes(&bytes)
+}
+
+fn hash_image_file(path: &std::path::Path) -> Option<i64> {
+    use std::hash::Hasher;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let size = usize::try_from(metadata.len()).ok()?;
+    let mut hasher = crate::infrastructure::stable_hash::StableHasher::new();
+    hasher.write_usize(size); // Same length prefix as hashing a byte slice.
+    let mut buf = [0; 64 * 1024];
+    let mut read = 0;
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+        hasher.write(&buf[..n]);
+    }
+    (read == size).then(|| hasher.finish() as i64)
 }
 
 pub fn init_db(path: &str) -> Result<Connection> {
@@ -157,14 +244,10 @@ pub fn init_db(path: &str) -> Result<Connection> {
 
 // save_entry removed (migrated to repository)
 
-pub fn save_image_bytes_to_file_with_extension(
-    image_bytes: &[u8],
-    data_dir: &std::path::Path,
-    extension: &str,
-) -> Option<String> {
+pub(crate) fn attachment_extension(image_bytes: &[u8], extension: &str) -> &'static str {
     // The bytes decide the extension: a GIF from a data URL labelled PNG, or a
     // BMP, used to be saved as .png.
-    let extension = image_extension_from_magic(image_bytes).unwrap_or(
+    image_extension_from_magic(image_bytes).unwrap_or(
         match extension.trim().to_ascii_lowercase().as_str() {
             "gif" => "gif",
             "jpg" | "jpeg" => "jpg",
@@ -172,7 +255,15 @@ pub fn save_image_bytes_to_file_with_extension(
             "bmp" => "bmp",
             _ => "png",
         },
-    );
+    )
+}
+
+pub fn save_image_bytes_to_file_with_extension(
+    image_bytes: &[u8],
+    data_dir: &std::path::Path,
+    extension: &str,
+) -> Option<String> {
+    let extension = attachment_extension(image_bytes, extension);
     write_attachment(&data_dir.join("attachments"), image_bytes, extension)
         .map(|path| path.to_string_lossy().to_string())
 }
@@ -516,5 +607,34 @@ mod tests {
         assert_eq!(resolve_entry_file_path("  ", &data_dir), None);
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_keeps_an_attachment_until_all_pending_writes_finish() {
+        let root = std::env::temp_dir().join(format!("cp-pending-{}", uuid::Uuid::new_v4()));
+        let mut image_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut image_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let image_bytes = image_bytes.into_inner();
+        let hash = super::stable_bytes_hash(&image_bytes);
+        let mut first = super::PendingAttachments::default();
+        let mut second = super::PendingAttachments::default();
+        let path = first.write(&root, &image_bytes, "png", hash).unwrap();
+        assert_eq!(
+            second.write(&root, &image_bytes, "png", hash).unwrap(),
+            path
+        );
+        assert_eq!(
+            super::calc_image_hash(path.to_str().unwrap()),
+            Some(hash as i64)
+        );
+        drop(first);
+        super::remove_idle_attachment(&path);
+        assert!(path.is_file());
+        drop(second);
+        super::remove_idle_attachment(&path);
+        assert!(!path.exists());
+        std::fs::remove_dir(root).unwrap();
     }
 }

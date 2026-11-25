@@ -27,6 +27,10 @@ pub fn prepare(legacy: &Path, destination: &Path) -> Result<(), String> {
             return Err(error("目标目录", "目标位置不是文件夹"));
         }
         if destination.join(JOURNAL).exists() {
+            let database = destination.join("clipboard.db");
+            if database.is_file() {
+                check_database(&database)?;
+            }
             return Ok(());
         }
         let empty = std::fs::read_dir(destination)
@@ -37,9 +41,6 @@ pub fn prepare(legacy: &Path, destination: &Path) -> Result<(), String> {
             if destination.join("clipboard.db").is_file()
                 || destination.join("datapath.txt").is_file()
             {
-                if destination.join("clipboard.db").is_file() {
-                    check_database(&destination.join("clipboard.db"))?;
-                }
                 return Ok(());
             }
             return Err(error("目标目录", "已有其他文件，未合并或覆盖"));
@@ -559,6 +560,18 @@ mod tests {
         std::fs::write(g.old().join("clipboard.db"), b"not sqlite").unwrap();
         assert!(prepare(&g.old(), &g.new_path()).is_err());
         assert!(g.old().join("clipboard.db").exists());
+    }
+
+    #[test]
+    fn normal_start_skips_integrity_scan_but_recovery_checks_the_database() {
+        let folder = Folder::new();
+        let destination = folder.new_path();
+        std::fs::create_dir(&destination).unwrap();
+        // A damaged database makes it observable whether prepare opened it.
+        std::fs::write(destination.join("clipboard.db"), b"not sqlite").unwrap();
+        assert!(prepare(&folder.old(), &destination).is_ok());
+        std::fs::write(destination.join(JOURNAL), b"1\n").unwrap();
+        assert!(prepare(&folder.old(), &destination).is_err());
     }
 
     #[test]

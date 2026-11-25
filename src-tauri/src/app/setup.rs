@@ -337,8 +337,8 @@ fn setup_state(
     app.manage(SessionHistory(std::sync::Mutex::new(
         std::collections::VecDeque::new(),
     )));
-    crate::services::clipboard::start_session_file_sweeper(app.handle().clone(), &app_dir);
     crate::app::commands::thumbnail_cmd::init_thumbnail_cache(app.handle());
+    crate::services::clipboard::start_session_file_sweeper(app.handle().clone(), &app_dir);
     app.manage(AppDataDir(std::sync::Mutex::new(app_dir)));
     app.manage(PasteQueue::default());
 }

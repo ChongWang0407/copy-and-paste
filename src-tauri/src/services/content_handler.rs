@@ -1,5 +1,6 @@
 // Content handler module for opening various content types.
 use crate::database::DbState;
+use crate::domain::models::{ClipboardEntry, EntryVersion};
 use crate::error::AppError;
 use crate::infrastructure::repository::clipboard_repo::ClipboardRepository;
 use crate::infrastructure::repository::settings_repo::SettingsRepository;
@@ -7,19 +8,48 @@ use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, LazyLock, Mutex, Once};
+use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager, State};
 
+#[derive(Clone)]
 struct WatchedEntryInfo {
+    app: tauri::AppHandle,
+    version: EntryVersion,
     path: std::path::PathBuf,
-    cancel: Arc<AtomicBool>,
-    last_activity: Arc<Mutex<Instant>>,
+    generation: u64,
+    last_activity: Instant,
+    last_file: Option<FileVersion>,
+    content_type: String,
+    keep_path: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileVersion {
+    modified: SystemTime,
+    pub len: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileVersion {
+    pub fn read(path: &std::path::Path) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
 }
 
 static WATCHED_PREVIEW_ENTRIES: LazyLock<Mutex<HashMap<i64, WatchedEntryInfo>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static PREVIEW_WATCH_READY: Condvar = Condvar::new();
 
 #[tauri::command]
 pub async fn open_content(
@@ -30,15 +60,15 @@ pub async fn open_content(
     content_type: String,
 ) -> Result<(), AppError> {
     let mut html_content = None;
+    let mut original_entry = None;
     // 0. Resolve full content if ID is provided and content is placeholder/truncated
     if id != 0 {
         if id > 0 {
             // Fetch from Database
-            if let Ok(Some((full_content, _, full_html))) =
-                state.repo.get_entry_content_with_html(id)
-            {
-                content = full_content;
-                html_content = full_html;
+            if let Ok(Some(entry)) = state.repo.get_entry_by_id(id) {
+                content = entry.content.clone();
+                html_content = entry.html_content.clone();
+                original_entry = Some(entry);
             }
         } else {
             // Fetch from Session
@@ -47,6 +77,7 @@ pub async fn open_content(
             if let Some(item) = session_items.iter().find(|i| i.id == id) {
                 content = item.content.clone();
                 html_content = item.html_content.clone();
+                original_entry = Some(item.clone());
             }
         }
     }
@@ -58,11 +89,7 @@ pub async fn open_content(
 
     let app_path = get_app_path_for_content_type(&state, &content_type)?;
     let filename = if id != 0 {
-        if id > 0 {
-            format!("CopyPaste_Clip_entry_{}", id)
-        } else {
-            format!("CopyPaste_Clip_session_{}", id.abs())
-        }
+        format!("CopyPaste_Clip_entry_{}_{}", id, uuid::Uuid::new_v4())
     } else {
         static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
         let count = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -93,7 +120,7 @@ pub async fn open_content(
     if is_file_type(&content_type) && !content.starts_with("data:image") {
         if let Some(path) = entry_file_path(&app_handle, &content) {
             let data_dir = app_data_dir(&app_handle);
-            entry_file = Some(file_to_open(&content_type, path, data_dir.as_deref()));
+            entry_file = Some(file_to_open(&content_type, path, data_dir.as_deref())?);
         } else if names_missing_file(&content_type, &content) {
             return Err(AppError::Validation(FILE_MISSING.into()));
         }
@@ -116,6 +143,7 @@ pub async fn open_content(
 
     let path_str = temp_path.to_str().unwrap().to_string();
     let file_path_clone = temp_path.clone();
+    let initial_file = FileVersion::read(&file_path_clone);
 
     // Launch the file with appropriate application
     launch_file_with_app(
@@ -128,13 +156,13 @@ pub async fn open_content(
     .await?;
 
     // Watch temp files and external originals so list previews stay in sync (#117).
-    if id != 0 && content_type != "rich_text" {
-        register_file_preview_watch(
+    if let Some(entry) = original_entry.filter(|entry| entry.content_type != "rich_text") {
+        register_watch(
             app_handle,
-            id,
+            &entry,
             file_path_clone,
-            content_type,
             use_direct_path,
+            initial_file,
         );
     }
 
@@ -210,102 +238,115 @@ pub async fn share_content(
     show_share_picker(&window, item, anchor).map_err(AppError::Internal)
 }
 
-/// Watch an on-disk file and refresh list previews when it changes.
+/// Watch an on-disk original and refresh its preview when it changes.
 pub fn register_file_preview_watch(
-    app_handle: tauri::AppHandle,
-    id: i64,
-    file_path: std::path::PathBuf,
-    content_type: String,
-    keep_path_on_change: bool,
+    app: tauri::AppHandle,
+    entry: &ClipboardEntry,
+    path: std::path::PathBuf,
+    keep_path: bool,
 ) {
-    if id == 0 {
-        return;
+    let initial = FileVersion::read(&path);
+    register_watch(app, entry, path, keep_path, initial);
+}
+
+fn register_watch(
+    app: tauri::AppHandle,
+    entry: &ClipboardEntry,
+    path: std::path::PathBuf,
+    keep_path: bool,
+    last_file: Option<FileVersion>,
+) {
+    static NEXT_WATCH: AtomicU64 = AtomicU64::new(1);
+    static WORKER: Once = Once::new();
+    let mut watched = WATCHED_PREVIEW_ENTRIES.lock().unwrap();
+    if let Some(existing) = watched.get_mut(&entry.id) {
+        if existing.version.matches(entry)
+            && (existing.path == path || (keep_path && !existing.keep_path))
+        {
+            existing.last_activity = Instant::now();
+            return;
+        }
     }
-
-    let (cancel_token, last_activity) = {
-        let mut watched = WATCHED_PREVIEW_ENTRIES.lock().unwrap();
-        if let Some(existing) = watched.get_mut(&id) {
-            if existing.path == file_path {
-                // Stable reuse of the same entry file: refresh activity timer and continue existing watch
-                *existing.last_activity.lock().unwrap() = Instant::now();
-                return;
-            } else {
-                // Path changed: signal cancellation to previous watcher and spawn new watcher
-                existing.cancel.store(true, Ordering::Relaxed);
-                let cancel = Arc::new(AtomicBool::new(false));
-                let last_act = Arc::new(Mutex::new(Instant::now()));
-                *existing = WatchedEntryInfo {
-                    path: file_path.clone(),
-                    cancel: cancel.clone(),
-                    last_activity: last_act.clone(),
-                };
-                (cancel, last_act)
-            }
-        } else {
-            let cancel = Arc::new(AtomicBool::new(false));
-            let last_act = Arc::new(Mutex::new(Instant::now()));
-            watched.insert(
-                id,
-                WatchedEntryInfo {
-                    path: file_path.clone(),
-                    cancel: cancel.clone(),
-                    last_activity: last_act.clone(),
-                },
-            );
-            (cancel, last_act)
-        }
-    };
-
-    std::thread::spawn(move || {
-        let mut last_mtime = std::fs::metadata(&file_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-
-            if cancel_token.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let elapsed = last_activity.lock().unwrap().elapsed().as_secs();
-            if elapsed >= 3600 {
-                break;
-            }
-
-            if !file_path.exists() {
-                break;
-            }
-
-            let current_mtime = std::fs::metadata(&file_path)
-                .ok()
-                .and_then(|m| m.modified().ok());
-
-            if current_mtime != last_mtime {
-                last_mtime = current_mtime;
-                println!("File changed detected: {:?}", file_path);
-
-                if keep_path_on_change {
-                    touch_external_file_preview(&app_handle, id);
-                } else if let Some((new_content, preview)) =
-                    read_changed_file(&file_path, &content_type)
-                {
-                    let new_content = store_edited_image(&app_handle, id, &content_type, new_content);
-                    update_database_with_changes(&app_handle, id, &new_content, &preview);
-                }
-            }
-        }
-
-        let mut watched = WATCHED_PREVIEW_ENTRIES.lock().unwrap();
-        if let Some(existing) = watched.get(&id) {
-            if existing.cancel.load(Ordering::Relaxed)
-                || existing.last_activity.lock().unwrap().elapsed().as_secs() >= 3600
-                || !file_path.exists()
-            {
-                watched.remove(&id);
-            }
-        }
+    watched.insert(
+        entry.id,
+        WatchedEntryInfo {
+            app,
+            version: EntryVersion::from_entry(entry),
+            path,
+            generation: NEXT_WATCH.fetch_add(1, Ordering::Relaxed),
+            last_activity: Instant::now(),
+            last_file,
+            content_type: entry.content_type.clone(),
+            keep_path,
+        },
+    );
+    PREVIEW_WATCH_READY.notify_one();
+    WORKER.call_once(|| {
+        std::thread::spawn(watch_files);
     });
+}
+
+fn watch_files() {
+    const RETENTION: Duration = Duration::from_secs(3600);
+    loop {
+        let watched = WATCHED_PREVIEW_ENTRIES.lock().unwrap();
+        drop(
+            PREVIEW_WATCH_READY
+                .wait_while(watched, |watches| watches.is_empty())
+                .unwrap(),
+        );
+        std::thread::sleep(Duration::from_secs(2));
+        let watches: Vec<_> = {
+            let mut watched = WATCHED_PREVIEW_ENTRIES.lock().unwrap();
+            watched.retain(|_, watch| watch.last_activity.elapsed() < RETENTION);
+            watched.values().cloned().collect()
+        };
+        for watch in watches {
+            let file = FileVersion::read(&watch.path);
+            if file == watch.last_file {
+                continue;
+            }
+            let updated = if watch.keep_path {
+                touch_external_file_preview(&watch, file.is_some())
+            } else if file.is_some() {
+                let Some((content, preview)) = read_changed_file(&watch.path, &watch.content_type)
+                else {
+                    continue;
+                };
+                update_database_with_changes(&watch, content, &preview)
+            } else {
+                continue; // An editor may be replacing the file by rename.
+            };
+            let updated = match updated {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!(">>> [CLIPBOARD] Could not refresh file preview: {error}");
+                    continue;
+                }
+            };
+            let mut watched = WATCHED_PREVIEW_ENTRIES.lock().unwrap();
+            let Some(current) = watched
+                .get_mut(&watch.version.id)
+                .filter(|item| item.generation == watch.generation)
+            else {
+                continue;
+            };
+            if let Some(entry) = updated {
+                current.last_file = file;
+                current.last_activity = Instant::now();
+                current.version = EntryVersion::from_entry(&entry);
+                let _ = watch.app.emit(
+                    "clipboard-updated",
+                    crate::services::clipboard::truncate_entry_for_ui(entry.clone()),
+                );
+                if entry.content_type == "image" && file.is_some() {
+                    crate::services::ocr::enqueue(&watch.app, &entry);
+                }
+            } else if watch.keep_path || file.is_some() {
+                watched.remove(&watch.version.id);
+            }
+        }
+    }
 }
 
 fn get_app_path_for_content_type(
@@ -528,31 +569,50 @@ fn launch_with_default_app(
     Ok(())
 }
 
-fn touch_external_file_preview(app_handle: &tauri::AppHandle, id: i64) {
-    let state = app_handle.state::<DbState>();
+fn touch_external_file_preview(
+    watch: &WatchedEntryInfo,
+    exists: bool,
+) -> Result<Option<ClipboardEntry>, String> {
     let now = chrono::Utc::now().timestamp_millis();
-    let mut updated_entry = None;
-
-    if id > 0 {
-        if state.repo.touch_entry(id, now).is_err() {
-            return;
-        }
-        if let Ok(Some(entry)) = state.repo.get_entry_by_id(id) {
-            updated_entry = Some(entry);
-        }
-    } else {
-        use crate::app_state::SessionHistory;
-        if let Some(session) = app_handle.try_state::<SessionHistory>() {
-            let mut history = session.0.lock().unwrap();
-            if let Some(item) = history.iter_mut().find(|i| i.id == id) {
-                item.timestamp = now;
-                updated_entry = Some(item.clone());
-            }
-        }
+    let id = watch.version.id;
+    let is_image = watch.content_type == "image";
+    let hash =
+        is_image.then(|| crate::database::calc_image_hash(&watch.version.content).unwrap_or(0));
+    let watched = WATCHED_PREVIEW_ENTRIES.lock().unwrap();
+    if !watch_is_current(&watched, watch) {
+        return Ok(None);
     }
-
-    if let Some(entry) = updated_entry {
-        let _ = app_handle.emit("clipboard-updated", entry);
+    if id > 0 {
+        let state = watch.app.state::<DbState>();
+        let conn = state.conn.lock().unwrap();
+        let Some(entry) = state.repo.get_entry_by_id_with_conn(&conn, id)? else {
+            return Ok(None);
+        };
+        if !watch.version.matches(&entry) {
+            return Ok(None);
+        }
+        state.repo.refresh_file_preview(&conn, id, now, hash)?;
+        let mut entry = state
+            .repo
+            .get_entry_by_id_with_conn(&conn, id)?
+            .expect("entry still exists");
+        entry.file_preview_exists = exists;
+        Ok(Some(entry))
+    } else {
+        let session = watch.app.state::<crate::app_state::SessionHistory>();
+        let mut history = session.0.lock().unwrap();
+        if let Some(entry) = history
+            .iter_mut()
+            .find(|entry| watch.version.matches(entry))
+        {
+            entry.timestamp = now;
+            entry.file_preview_exists = exists;
+            if is_image {
+                entry.ocr_text = None;
+            }
+            return Ok(Some(entry.clone()));
+        }
+        Ok(None)
     }
 }
 
@@ -628,51 +688,61 @@ fn generate_preview(content: &str) -> String {
 }
 
 fn update_database_with_changes(
-    app_handle: &tauri::AppHandle,
-    id: i64,
-    new_content: &str,
+    watch: &WatchedEntryInfo,
+    new_content: String,
     preview: &str,
-) {
-    let state = app_handle.state::<DbState>();
-    let mut updated_entry = None;
-
+) -> Result<Option<ClipboardEntry>, String> {
+    let mut pending = crate::database::PendingAttachments::default();
+    let id = watch.version.id;
+    let new_content = if watch.content_type == "image" {
+        store_edited_image(&watch.app, id, &new_content, &mut pending)?
+    } else {
+        new_content
+    };
+    let watched = WATCHED_PREVIEW_ENTRIES.lock().unwrap();
+    if !watch_is_current(&watched, watch) {
+        return Ok(None);
+    }
     if id > 0 {
-        if state
+        let state = watch.app.state::<DbState>();
+        let conn = state.conn.lock().unwrap();
+        let Some(entry) = state.repo.get_entry_by_id_with_conn(&conn, id)? else {
+            return Ok(None);
+        };
+        if !watch.version.matches(&entry) {
+            return Ok(None);
+        }
+        state
             .repo
-            .update_entry_content(id, new_content, preview)
-            .is_err()
-        {
-            return;
-        }
-
-        if let Ok(Some(entry)) = state.repo.get_entry_by_id(id) {
-            updated_entry = Some(entry);
-        }
+            .update_entry_content_with_conn(&conn, id, &new_content, preview)?;
+        state.repo.get_entry_by_id_with_conn(&conn, id)
     } else {
-        use crate::app_state::SessionHistory;
-        if let Some(session) = app_handle.try_state::<SessionHistory>() {
-            let mut history = session.0.lock().unwrap();
-            if let Some(item) = history.iter_mut().find(|i| i.id == id) {
-                item.content = new_content.to_string();
-                item.preview = preview.to_string();
-                item.html_content = None;
-                if item.content_type == "rich_text" {
-                    item.content_type = "text".to_string();
-                }
-                updated_entry = Some(item.clone());
-            }
+        let session = watch.app.state::<crate::app_state::SessionHistory>();
+        let mut history = session.0.lock().unwrap();
+        let Some(entry) = history
+            .iter_mut()
+            .find(|entry| watch.version.matches(entry))
+        else {
+            return Ok(None);
+        };
+        if entry.content != new_content && entry.content_type == "image" {
+            entry.ocr_text = None;
+            entry.is_external = true;
         }
+        entry.content = new_content;
+        entry.preview = preview.to_string();
+        entry.html_content = None;
+        if entry.content_type == "rich_text" {
+            entry.content_type = "text".into();
+        }
+        Ok(Some(entry.clone()))
     }
+}
 
-    if let Some(entry) = updated_entry {
-        let _ = app_handle.emit("clipboard-updated", entry);
-        println!(
-            "Clipboard entry updated and clipboard-updated event emitted for id: {}",
-            id
-        );
-    } else {
-        let _ = app_handle.emit("clipboard-changed", id);
-    }
+fn watch_is_current(watched: &HashMap<i64, WatchedEntryInfo>, watch: &WatchedEntryInfo) -> bool {
+    watched
+        .get(&watch.version.id)
+        .is_some_and(|current| current.generation == watch.generation)
 }
 
 pub(crate) fn app_data_dir(app_handle: &tauri::AppHandle) -> Option<std::path::PathBuf> {
@@ -697,36 +767,48 @@ fn file_to_open(
     content_type: &str,
     path: std::path::PathBuf,
     data_dir: Option<&std::path::Path>,
-) -> FileToOpen {
+) -> Result<FileToOpen, AppError> {
     if content_type == "image" && data_dir.is_some_and(|dir| path.starts_with(dir)) {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image.png");
-        let copy = std::env::temp_dir().join(format!("CopyPaste_Clip_edit_{}", name));
-        if std::fs::copy(&path, &copy).is_ok() {
-            return FileToOpen { path: copy, is_original: false };
-        }
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("png");
+        let copy = std::env::temp_dir().join(format!(
+            "CopyPaste_Clip_edit_{}.{extension}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::copy(&path, &copy)?;
+        return Ok(FileToOpen {
+            path: copy,
+            is_original: false,
+        });
     }
-    FileToOpen { path, is_original: true }
+    Ok(FileToOpen {
+        path,
+        is_original: true,
+    })
 }
 
-/// An edited image arrives as a data URL; keep it as an attachment file
-/// rather than a large data URL in the database.
 fn store_edited_image(
-    app_handle: &tauri::AppHandle,
+    app: &tauri::AppHandle,
     id: i64,
-    content_type: &str,
-    content: String,
-) -> String {
-    if content_type != "image" || !content.starts_with("data:") {
-        return content;
+    content: &str,
+    pending: &mut crate::database::PendingAttachments,
+) -> Result<String, String> {
+    let (_, encoded) = content.split_once(',').ok_or("invalid edited image")?;
+    let bytes = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|err| err.to_string())?;
+    let mut root = app_data_dir(app).ok_or("data directory unavailable")?;
+    if id < 0 {
+        root.push("session");
     }
-    let Some(data_dir) = app_data_dir(app_handle) else {
-        return content;
-    };
-    // Database entries (id > 0, e.g. pinned while persistence is off) keep
-    // their files in attachments/; only session entries use session/, which
-    // is swept once no session entry shows the file.
-    let root = if id > 0 { data_dir.clone() } else { data_dir.join("session") };
-    crate::database::save_image_to_file(&content, &root).unwrap_or(content)
+    let ext = crate::database::attachment_extension(&bytes, "png");
+    let hash = crate::database::stable_bytes_hash(&bytes);
+    let path = pending
+        .write(&root.join("attachments"), &bytes, ext, hash)
+        .ok_or("could not save edited image")?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -771,15 +853,20 @@ mod tests {
         let outside = root.join("photo.png");
         std::fs::write(&outside, b"photo").unwrap();
 
-        let copy = file_to_open("image", saved.clone(), Some(&data_dir));
+        let copy = file_to_open("image", saved.clone(), Some(&data_dir)).unwrap();
+        let second_copy = file_to_open("image", saved.clone(), Some(&data_dir)).unwrap();
         assert!(!copy.is_original);
         assert_ne!(copy.path, saved);
+        assert_ne!(copy.path, second_copy.path);
         assert_eq!(std::fs::read(&copy.path).unwrap(), b"png bytes");
+        std::fs::write(&copy.path, b"edited bytes").unwrap();
+        assert_eq!(std::fs::read(&second_copy.path).unwrap(), b"png bytes");
+        std::fs::remove_file(second_copy.path).unwrap();
 
-        let original = file_to_open("image", outside.clone(), Some(&data_dir));
+        let original = file_to_open("image", outside.clone(), Some(&data_dir)).unwrap();
         assert!(original.is_original);
         assert_eq!(original.path, outside);
-        let file = file_to_open("file", saved.clone(), Some(&data_dir));
+        let file = file_to_open("file", saved.clone(), Some(&data_dir)).unwrap();
         assert!(file.is_original);
         assert_eq!(file.path, saved);
 

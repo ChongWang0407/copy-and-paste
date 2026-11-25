@@ -305,11 +305,21 @@ pub fn decrypt_stored_value(value: &str) -> Result<String, String> {
     decrypt_value(value).ok_or_else(|| "stored value cannot be decrypted; original data preserved".into())
 }
 
+pub(crate) fn encode_plain_for_storage(value: &str) -> String {
+    if is_encrypted_value(value) {
+        format!("{LEGACY_PLAIN_PREFIX}{value}")
+    } else {
+        value.to_string()
+    }
+}
+
 /// Encode literal plaintext for storage; portable builds deliberately save plaintext.
 /// Call decrypt_stored_value explicitly before passing an existing storage envelope.
 pub fn encrypt_for_storage(value: &str) -> Result<String, String> {
     #[cfg(feature = "portable")]
-    { Ok(value.to_string()) }
+    {
+        Ok(encode_plain_for_storage(value))
+    }
     #[cfg(not(feature = "portable"))]
     { encrypt_value(value).ok_or_else(|| "encryption unavailable; value was not saved".into()) }
 }
@@ -465,9 +475,9 @@ fn migrate_legacy_in_transaction(conn: &rusqlite::Connection) -> Result<usize, S
         let mut updates: Vec<(i64, String, String, Option<String>)> = Vec::new();
         for row in rows {
             let (id, content, preview, html) = row.map_err(|e| e.to_string())?;
-            let new_content = upgrade_field(&content);
-            let new_preview = upgrade_field(&preview);
-            let new_html = html.as_ref().map(|h| upgrade_field(h));
+            let new_content = upgrade_history_field(&content);
+            let new_preview = upgrade_history_field(&preview);
+            let new_html = html.as_ref().map(|h| upgrade_history_field(h));
             if new_content != content
                 || new_preview != preview
                 || new_html.as_ref() != html.as_ref()
@@ -486,6 +496,18 @@ fn migrate_legacy_in_transaction(conn: &rusqlite::Connection) -> Result<usize, S
     }
 
     Ok(upgraded)
+}
+
+fn upgrade_history_field(value: &str) -> String {
+    // A plain envelope containing a reserved prefix escapes literal user text.
+    if value
+        .strip_prefix(LEGACY_PLAIN_PREFIX)
+        .is_some_and(is_encrypted_value)
+    {
+        value.to_string()
+    } else {
+        upgrade_field(value)
+    }
 }
 
 fn upgrade_field(value: &str) -> String {

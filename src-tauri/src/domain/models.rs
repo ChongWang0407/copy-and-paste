@@ -47,3 +47,30 @@ pub struct ClipboardEntry {
 fn default_true() -> bool {
     true
 }
+
+/// The content a background job read, independent of pinning and paste order.
+#[derive(Clone)]
+pub(crate) struct EntryVersion {
+    pub id: i64,
+    created_at: i64,
+    content_type: String,
+    pub content: String,
+}
+
+impl EntryVersion {
+    pub fn from_entry(entry: &ClipboardEntry) -> Self {
+        Self {
+            id: entry.id,
+            created_at: entry.created_at,
+            content_type: entry.content_type.clone(),
+            content: entry.content.clone(),
+        }
+    }
+
+    pub fn matches(&self, entry: &ClipboardEntry) -> bool {
+        entry.id == self.id
+            && entry.created_at == self.created_at
+            && entry.content_type == self.content_type
+            && entry.content == self.content
+    }
+}

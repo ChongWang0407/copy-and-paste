@@ -170,7 +170,6 @@ pub trait ClipboardRepository {
     fn get_entry_content(&self, id: i64) -> Result<Option<String>, String>;
     fn get_entry_content_full(&self, id: i64) -> Result<Option<(String, String)>, String>;
     fn get_ocr_text(&self, id: i64) -> Result<Option<String>, String>;
-    fn set_ocr_text(&self, id: i64, text: &str) -> Result<(), String>;
     fn get_entry_content_with_html(
         &self,
         id: i64,
@@ -263,7 +262,13 @@ impl SqliteClipboardRepository {
 
         conn.execute(
             "UPDATE clipboard_history SET content = ?, preview = ?, html_content = ?, content_hash = ? WHERE id = ?",
-            params![content_plain, preview_plain, html_plain, new_hash, id],
+            params![
+                encryption::encode_plain_for_storage(&content_plain),
+                encryption::encode_plain_for_storage(&preview_plain),
+                html_plain.as_deref().map(encryption::encode_plain_for_storage),
+                new_hash,
+                id
+            ],
         ).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -562,10 +567,6 @@ impl SqliteClipboardRepository {
         precomputed_content_hash: Option<i64>,
     ) -> Result<i64, String> {
         if entry.id > 0 { self.validate_entry_with_conn(conn, entry.id)?; }
-        let mut entry = entry.clone();
-        entry.content = self.maybe_decrypt_text(&entry.content)?;
-        entry.preview = self.maybe_decrypt_text(&entry.preview)?;
-        entry.html_content = entry.html_content.as_deref().map(|v| self.maybe_decrypt_text(v)).transpose()?;
         // Encrypt only when explicitly marked as sensitive
         let should_encrypt = has_sensitive_tag(&entry.tags);
 
@@ -632,10 +633,13 @@ impl SqliteClipboardRepository {
             )
         } else {
             (
-                final_content.clone(),
-                entry.preview.clone(),
+                encryption::encode_plain_for_storage(&final_content),
+                encryption::encode_plain_for_storage(&entry.preview),
                 calculated_hash,
-                entry.html_content.clone(),
+                entry
+                    .html_content
+                    .as_deref()
+                    .map(encryption::encode_plain_for_storage),
             )
         };
 
@@ -662,9 +666,10 @@ impl SqliteClipboardRepository {
             entry.timestamp
         };
 
-        if entry.id > 0 {
+        let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let id = if entry.id > 0 {
             // Update existing entry (Move to top logic)
-            conn.execute(
+            let updated = transaction.execute(
                 "UPDATE clipboard_history SET 
                     content_type = ?1, 
                     content = ?2, 
@@ -673,7 +678,8 @@ impl SqliteClipboardRepository {
                     timestamp = ?5, 
                     sort_at = ?5,
                     preview = ?6, 
-                    content_hash = ?7, 
+                    ocr_text = CASE WHEN content_type = 'image' AND content_hash <> ?7 THEN NULL ELSE ocr_text END,
+                    content_hash = ?7,
                     tags = ?8, 
                     is_external = ?9,
                     source_app_path = ?10,
@@ -694,11 +700,13 @@ impl SqliteClipboardRepository {
                 ],
             )
             .map_err(|e| e.to_string())?;
-            self.sync_entry_tags_with_conn(conn, entry.id, &cleaned_tags)?;
-            Ok(entry.id)
+            if updated != 1 {
+                return Err("clipboard entry disappeared before it was saved".into());
+            }
+            entry.id
         } else {
             // Insert new entry
-            conn.execute(
+            transaction.execute(
                 "INSERT INTO clipboard_history (content_type, content, html_content, source_app, timestamp, created_at, last_used_at, sort_at, preview, is_pinned, content_hash, tags, is_external, pinned_order, source_app_path, note, use_count)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
@@ -722,10 +730,11 @@ impl SqliteClipboardRepository {
                 ],
             ).map_err(|e| e.to_string())?;
 
-            let new_id = conn.last_insert_rowid();
-            self.sync_entry_tags_with_conn(conn, new_id, &cleaned_tags)?;
-            Ok(new_id)
-        }
+            transaction.last_insert_rowid()
+        };
+        self.sync_entry_tags_with_conn(&transaction, id, &cleaned_tags)?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(id)
     }
 
     /// Delete one entry and remove its attachment files that no other entry
@@ -758,11 +767,9 @@ impl SqliteClipboardRepository {
         let repo = Self::new(self.conn.clone());
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(120));
-            let unused = match repo.conn.lock() {
-                Ok(conn) => repo.unreferenced_files(&conn, candidates),
-                Err(_) => return,
-            };
-            remove_attachment_files(unused);
+            if let Ok(conn) = repo.conn.lock() {
+                remove_attachment_files(repo.unreferenced_files(&conn, candidates));
+            }
         });
         Ok(())
     }
@@ -876,12 +883,134 @@ impl SqliteClipboardRepository {
     /// Return every textual candidate so a different rich-text format cannot
     /// hide a later match. Callers verify decrypted content and HTML.
     pub fn find_text_candidates_with_conn(&self, conn: &Connection, content: &str) -> Result<Vec<i64>, String> {
-        let hash = calc_text_hash(content) as i64;
-        let mut stmt = conn.prepare(
-            "SELECT id FROM clipboard_history WHERE content_type IN ('text','code','url','rich_text') AND (content_hash = ?1 OR content = ?2) ORDER BY sort_at DESC, id DESC"
-        ).map_err(|e| e.to_string())?;
-        let rows = stmt.query_map(params![hash, content], |row| row.get(0)).map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<i64>, _>>().map_err(|e| e.to_string())
+        self.find_text_capture_candidates(conn, content, calc_text_hash(content) as i64)
+    }
+
+    pub(crate) fn find_text_capture_candidates(
+        &self,
+        conn: &Connection,
+        content: &str,
+        hash: i64,
+    ) -> Result<Vec<i64>, String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, sort_at FROM clipboard_history
+             WHERE content_type IN ('text','code','url','rich_text') AND content_hash = ?1
+             UNION ALL
+             SELECT id, sort_at FROM clipboard_history
+             WHERE content_type IN ('text','code','url','rich_text') AND content_hash = 0
+               AND ?1 <> 0 AND content IN (?2, ?3)
+             ORDER BY sort_at DESC, id DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![hash, content, format!("plain:{content}")], |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<i64>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn find_image_capture_candidate(
+        &self,
+        conn: &Connection,
+        content: &str,
+        hash: Option<i64>,
+    ) -> Result<Option<i64>, String> {
+        conn.query_row(
+            "SELECT id FROM (
+                SELECT id, sort_at FROM clipboard_history
+                WHERE content_type = 'image' AND content_hash = ?1 AND ?1 <> 0
+                UNION ALL
+                SELECT id, sort_at FROM clipboard_history
+                WHERE content_type = 'image' AND content_hash = 0 AND content = ?2
+             ) ORDER BY sort_at DESC, id DESC LIMIT 1",
+            params![hash, content],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn store_capture_html(
+        &self,
+        conn: &Connection,
+        version: &crate::domain::models::EntryVersion,
+        original: &str,
+        html: String,
+    ) -> Result<Option<ClipboardEntry>, String> {
+        let Some(mut entry) = self.get_entry_by_id_with_conn(conn, version.id)? else {
+            return Ok(None);
+        };
+        if !version.matches(&entry) || entry.html_content.as_deref() != Some(original) {
+            return Ok(None);
+        }
+        let stored = if has_sensitive_tag(&entry.tags) {
+            self.maybe_encrypt_text(&html)?
+        } else {
+            encryption::encode_plain_for_storage(&html)
+        };
+        conn.execute(
+            "UPDATE clipboard_history SET html_content = ?1 WHERE id = ?2",
+            params![stored, entry.id],
+        )
+        .map_err(|e| e.to_string())?;
+        entry.html_content = Some(html);
+        Ok(Some(entry))
+    }
+
+    pub(crate) fn store_ocr_for_version(
+        &self,
+        conn: &Connection,
+        version: &crate::domain::models::EntryVersion,
+        text: &str,
+    ) -> Result<bool, String> {
+        if !self
+            .get_entry_by_id_with_conn(conn, version.id)?
+            .is_some_and(|entry| version.matches(&entry))
+        {
+            return Ok(false);
+        }
+        conn.execute(
+            "UPDATE clipboard_history SET ocr_text = ?1 WHERE id = ?2",
+            params![text, version.id],
+        )
+        .map(|count| count == 1)
+        .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn get_ocr_text_with_conn(
+        &self,
+        conn: &Connection,
+        id: i64,
+    ) -> Result<Option<String>, String> {
+        conn.query_row(
+            "SELECT ocr_text FROM clipboard_history WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn refresh_file_preview(
+        &self,
+        conn: &Connection,
+        id: i64,
+        timestamp: i64,
+        image_hash: Option<i64>,
+    ) -> Result<(), String> {
+        conn.execute(
+            "UPDATE clipboard_history SET timestamp = ?1, sort_at = ?1,
+                content_hash = COALESCE(?2, content_hash),
+                ocr_text = CASE WHEN ?2 IS NOT NULL THEN NULL ELSE ocr_text END
+             WHERE id = ?3",
+            params![timestamp, image_hash, id],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     pub fn find_by_content_with_conn(
@@ -891,21 +1020,7 @@ impl SqliteClipboardRepository {
         content_type: Option<&str>,
     ) -> Result<Option<i64>, String> {
         if content_type == Some("image") {
-            if let Some(hash) = calc_image_hash(content) {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id FROM clipboard_history \
-                     WHERE (content_type = 'image' AND content_hash = ?) OR content = ?",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let mut rows = stmt
-                    .query(params![hash, content])
-                    .map_err(|e| e.to_string())?;
-                if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                    return Ok(Some(row.get(0).map_err(|e| e.to_string())?));
-                }
-                return Ok(None);
-            }
+            return self.find_image_capture_candidate(conn, content, calc_image_hash(content));
         }
 
         let hash = calc_text_hash(content) as i64;
@@ -1106,10 +1221,6 @@ impl SqliteClipboardRepository {
         preview: &str,
     ) -> Result<(), String> {
         self.validate_entry_with_conn(conn, id)?;
-        let content = self.maybe_decrypt_text(content)?;
-        let preview = self.maybe_decrypt_text(preview)?;
-        let content = content.as_str();
-        let preview = preview.as_str();
         let (old_content_raw, content_type, tags_json, has_html) = conn
             .query_row(
                 "SELECT content, content_type, tags, (html_content IS NOT NULL) FROM clipboard_history WHERE id = ?",
@@ -1151,34 +1262,37 @@ impl SqliteClipboardRepository {
             } else {
                 conn.execute(
                     "UPDATE clipboard_history SET content = ?, preview = ?, content_hash = ?, html_content = NULL, content_type = ? WHERE id = ?",
-                    params![content, preview, hash, new_type, id],
+                    params![encryption::encode_plain_for_storage(content), encryption::encode_plain_for_storage(preview), hash, new_type, id],
                 ).map_err(|e| e.to_string())?;
             }
             return Ok(());
         }
-        if content_type == "image" {
-            // Duplicate checks find images by this hash: left at the original's,
-            // copying the original again overwrote the edited image.
-            if let Some(hash) = calc_image_hash(content) {
-                conn.execute(
-                    "UPDATE clipboard_history SET content_hash = ? WHERE id = ?",
-                    params![hash, id],
-                ).map_err(|e| e.to_string())?;
-            }
-        }
-        if should_encrypt {
-            let encrypted_content = self.maybe_encrypt_text(content)?;
-            let encrypted_preview = self.maybe_encrypt_text(preview)?;
-            conn.execute(
-                "UPDATE clipboard_history SET content = ?, preview = ?, html_content = NULL WHERE id = ?",
-                params![encrypted_content, encrypted_preview, id],
-            ).map_err(|e| e.to_string())?;
+        let (content_value, preview_value) = if should_encrypt {
+            (
+                self.maybe_encrypt_text(content)?,
+                self.maybe_encrypt_text(preview)?,
+            )
         } else {
-            conn.execute(
-                "UPDATE clipboard_history SET content = ?, preview = ?, html_content = NULL WHERE id = ?",
-                params![content, preview, id],
-            ).map_err(|e| e.to_string())?;
-        }
+            (
+                encryption::encode_plain_for_storage(content),
+                encryption::encode_plain_for_storage(preview),
+            )
+        };
+        let image_hash = (content_type == "image").then(|| calc_image_hash(content).unwrap_or(0));
+        conn.execute(
+            "UPDATE clipboard_history SET content = ?1, preview = ?2, html_content = NULL,
+                content_hash = COALESCE(?3, content_hash),
+                ocr_text = CASE WHEN ?3 IS NOT NULL THEN NULL ELSE ocr_text END,
+                is_external = COALESCE(?4, is_external) WHERE id = ?5",
+            params![
+                content_value,
+                preview_value,
+                image_hash,
+                image_hash.map(|_| std::path::Path::new(content).is_absolute()),
+                id
+            ],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -1732,24 +1846,7 @@ impl ClipboardRepository for SqliteClipboardRepository {
 
     fn get_ocr_text(&self, id: i64) -> Result<Option<String>, String> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT ocr_text FROM clipboard_history WHERE id = ?1",
-            params![id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map(Option::flatten)
-        .map_err(|e| e.to_string())
-    }
-
-    fn set_ocr_text(&self, id: i64, text: &str) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE clipboard_history SET ocr_text = ?1 WHERE id = ?2",
-            params![text, id],
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        self.get_ocr_text_with_conn(&conn, id)
     }
 
     fn get_entry_content_with_html(
@@ -1801,6 +1898,157 @@ mod tests {
         conn.execute("UPDATE clipboard_history SET content_hash = ?1", params![calc_text_hash("same") as i64]).unwrap();
         assert_eq!(repo.find_text_candidates_with_conn(&conn, "same").unwrap(), vec![3,2,1]);
         assert_eq!(repo.find_text_candidates_with_conn(&conn, "different").unwrap(), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn captured_and_edited_text_keep_literal_storage_prefixes() {
+        let repo = search_repository("INSERT INTO clipboard_history (id, content_type, content, timestamp, source_app, preview) VALUES (1,'text','plain:legacy',1,'test','plain:legacy');");
+        let conn = repo.conn.lock().unwrap();
+        assert_eq!(
+            repo.get_entry_by_id_with_conn(&conn, 1)
+                .unwrap()
+                .unwrap()
+                .content,
+            "legacy"
+        );
+        for value in ["plain:hello", "enc1:hello", "dpapi:hello"] {
+            let mut entry = repo.get_entry_by_id_with_conn(&conn, 1).unwrap().unwrap();
+            entry.id = 0;
+            entry.content = value.to_string();
+            entry.preview = value.to_string();
+            let id = repo.save_with_conn(&conn, &entry, None, None).unwrap();
+            let saved = repo.get_entry_by_id_with_conn(&conn, id).unwrap().unwrap();
+            assert_eq!(saved.content, value);
+            assert_eq!(saved.preview, value);
+            repo.decrypt_entry_with_conn(&conn, id).unwrap();
+            assert_eq!(
+                repo.get_entry_by_id_with_conn(&conn, id)
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                value
+            );
+            repo.update_entry_content_with_conn(&conn, id, "dpapi:edit", "plain:preview")
+                .unwrap();
+            let edited = repo.get_entry_by_id_with_conn(&conn, id).unwrap().unwrap();
+            assert_eq!(edited.content, "dpapi:edit");
+            assert_eq!(edited.preview, "plain:preview");
+        }
+    }
+
+    #[test]
+    fn image_dedup_does_not_return_text_with_the_same_path() {
+        let file = std::env::temp_dir().join(format!("cp-dedup-{}.png", uuid::Uuid::new_v4()));
+        image::RgbImage::new(2, 2).save(&file).unwrap();
+        let path = file.to_str().unwrap();
+        let repo = search_repository("");
+        let conn = repo.conn.lock().unwrap();
+        conn.execute("INSERT INTO clipboard_history (content_type, content, timestamp, source_app, preview) VALUES ('text',?1,1,'test','')", [path]).unwrap();
+        let matched = repo
+            .find_by_content_with_conn(&conn, path, Some("image"))
+            .unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn failed_tag_sync_rolls_back_capture_update() {
+        let repo = search_repository("INSERT INTO clipboard_history (id, content_type, content, timestamp, source_app, preview) VALUES (1,'text','original',1,'test','');");
+        let conn = repo.conn.lock().unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_tag BEFORE INSERT ON entry_tags BEGIN SELECT RAISE(ABORT, 'cannot insert tag'); END;").unwrap();
+        let mut entry = repo.get_entry_by_id_with_conn(&conn, 1).unwrap().unwrap();
+        entry.content = "updated".into();
+        entry.tags = vec!["example".into()];
+        assert!(repo.save_with_conn(&conn, &entry, None, None).is_err());
+        assert_eq!(
+            repo.get_entry_by_id_with_conn(&conn, 1)
+                .unwrap()
+                .unwrap()
+                .content,
+            "original"
+        );
+    }
+
+    #[test]
+    fn ocr_writeback_rejects_a_reused_id_and_an_edited_image() {
+        use crate::domain::models::EntryVersion;
+        let repo = search_repository("INSERT INTO clipboard_history (id, content_type, content, timestamp, created_at, source_app, preview, ocr_text) VALUES (1,'image','/before.png',1,1,'test','','previous');");
+        let conn = repo.conn.lock().unwrap();
+        let version =
+            EntryVersion::from_entry(&repo.get_entry_by_id_with_conn(&conn, 1).unwrap().unwrap());
+        repo.update_entry_content_with_conn(&conn, 1, "/after.png", "")
+            .unwrap();
+        assert_eq!(repo.get_ocr_text_with_conn(&conn, 1).unwrap(), None);
+        assert!(!repo
+            .store_ocr_for_version(&conn, &version, "stale")
+            .unwrap());
+        conn.execute("DELETE FROM clipboard_history WHERE id = 1", [])
+            .unwrap();
+        conn.execute("INSERT INTO clipboard_history (id, content_type, content, timestamp, created_at, source_app, preview) VALUES (1,'image','/before.png',2,2,'test','')", []).unwrap();
+        assert!(!repo
+            .store_ocr_for_version(&conn, &version, "stale")
+            .unwrap());
+        let fresh =
+            EntryVersion::from_entry(&repo.get_entry_by_id_with_conn(&conn, 1).unwrap().unwrap());
+        assert!(repo
+            .store_ocr_for_version(&conn, &fresh, "current")
+            .unwrap());
+        assert_eq!(
+            repo.get_ocr_text_with_conn(&conn, 1).unwrap().as_deref(),
+            Some("current")
+        );
+    }
+
+    #[test]
+    fn remote_image_writeback_updates_only_the_original_html() {
+        use crate::domain::models::EntryVersion;
+        let repo = search_repository(
+            r#"INSERT INTO clipboard_history (id, content_type, content, timestamp, created_at, source_app, preview, html_content) VALUES (1,'rich_text','caption',1,1,'test','','<img src="remote.png">');"#,
+        );
+        let conn = repo.conn.lock().unwrap();
+        let entry = repo.get_entry_by_id_with_conn(&conn, 1).unwrap().unwrap();
+        let version = EntryVersion::from_entry(&entry);
+        let html = entry.html_content.unwrap();
+        let updated = repo
+            .store_capture_html(&conn, &version, &html, r#"<img src="local.png">"#.into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.html_content.as_deref(),
+            Some(r#"<img src="local.png">"#)
+        );
+        assert_eq!(updated.content, "caption");
+        assert!(repo
+            .store_capture_html(&conn, &version, &html, "obsolete".into())
+            .unwrap()
+            .is_none());
+        repo.update_entry_content_with_conn(&conn, 1, "edited", "edited")
+            .unwrap();
+        assert!(repo
+            .store_capture_html(&conn, &version, &html, "obsolete".into())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn image_lookup_reuses_capture_hash_and_keeps_hashless_paths() {
+        let repo = search_repository("INSERT INTO clipboard_history (id, content_type, content, timestamp, source_app, preview, content_hash) VALUES (1,'image','/cached.png',1,'test','',123), (2,'image','/legacy.png',1,'test','',0);");
+        let conn = repo.conn.lock().unwrap();
+        assert_eq!(
+            repo.find_image_capture_candidate(&conn, "/unavailable.png", Some(123))
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            repo.find_image_capture_candidate(&conn, "/legacy.png", Some(42))
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            repo.find_image_capture_candidate(&conn, "/cached.png", Some(42))
+                .unwrap(),
+            None
+        );
     }
 
     fn search_ids(
@@ -2011,7 +2259,6 @@ mod tests {
 /// Remove attachment files (and their cached thumbnails).
 pub fn remove_attachment_files(paths: Vec<std::path::PathBuf>) {
     for path in paths {
-        crate::app::commands::thumbnail_cmd::remove_cached_thumbnails(&path);
-        let _ = std::fs::remove_file(&path);
+        crate::database::remove_idle_attachment(&path);
     }
 }

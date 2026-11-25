@@ -96,7 +96,14 @@ const imageSizes = new Map<number, ImageSize>();
 
 const ImagePreview = ({ item, t }: { item: ClipboardEntry; t: Translate }) => {
   const missing = item.is_external && item.file_preview_exists === false;
-  const src = useImageThumbnail(missing ? null : item.content, item.is_external, item.timestamp);
+  // Captured attachments are named by their bytes. In-place edits to external
+  // files still need the preview refresh timestamp.
+  const isCapturedAttachment = /\/attachments\/img_[0-9a-f]{1,16}\.(png|jpg|gif|webp|bmp)$/.test(item.content);
+  const src = useImageThumbnail(
+    missing ? null : item.content,
+    item.is_external,
+    isCapturedAttachment ? undefined : item.timestamp,
+  );
   const [failed, setFailed] = useState(false);
   const [size, setSize] = useState(() => imageSizes.get(item.id));
   if (missing || failed) {
