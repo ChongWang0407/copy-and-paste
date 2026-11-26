@@ -1,6 +1,6 @@
 [package]
 name = "copy-paste"
-version = "1.0.0"
+version = "1.1.0"
 description = "Copy & Paste - a liquid glass clipboard manager for macOS"
 authors = ["wangchong"]
 edition = "2021"
