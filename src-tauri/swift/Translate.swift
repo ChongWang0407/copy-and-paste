@@ -94,6 +94,8 @@ private func describe(_ error: Error) -> String {
         if text.localizedCaseInsensitiveContains("cancel") { return "cancelled" }
         return translation.localizedDescription
     }
+    let nsError = error as NSError
+    if nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError { return "cancelled" }
     return error.localizedDescription
 }
 
